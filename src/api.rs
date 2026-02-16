@@ -374,7 +374,7 @@ pub async fn create_dir(
     name: &str,
     parent_node: &str,
 ) -> Result<Value> {
-    let node_key: Vec<u8> = (0..16).map(|_| rand::thread_rng().gen()).collect();
+    let node_key: Vec<u8> = (0..16).map(|_| rand::thread_rng().gen::<u8>()).collect();
     let enc_att = encrypt_mega_attr(&format!(r#"{{"n":"{}"}}"#, name), &node_key)?;
     let master_key_bin = i32a_to_bin(&session.master_key);
     let enc_key = aes_ecb_encrypt(&node_key, &master_key_bin)?;
