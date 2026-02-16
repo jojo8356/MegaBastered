@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target/
+debug/
+*.pdb
+
+# Cargo lock is committed for binaries
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Temporary files
+*.tmp
+*.megacli.tmp
