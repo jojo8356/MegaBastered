@@ -15,6 +15,7 @@ No Java, no Electron, no bloat. Just a single binary that handles downloads, upl
 - **Resumable transfers** - Per-chunk index (`.megacli.parts`): an interrupted download resumes exactly where it stopped, and a partial file is never reported as complete
 - **Quota aware** - asks MEGA how much transfer quota is left for your IP (`--quota`), stops cleanly on HTTP 509 and can wait/resume on its own (`--quota-wait`)
 - **Proxy support** - route every MEGA request through your own HTTP/SOCKS5 proxy or VPN endpoint (`--proxy`)
+- **Forgiving links** - links pasted from a chat as `[label](url)`, inside quotes, angle brackets or a sentence are understood
 - **Scriptable CLI** - `megacli <link>` to download, `megacli --list <link> [-d dest]` to see what is already done
 - **Instant re-runs** - a concurrent pre-scan of the destination lists what is already complete, those files are never touched again and their leftovers are cleaned
 - **Quota monitoring** - Check storage usage and remaining space
@@ -49,7 +50,7 @@ Binary output: `target/release/megacli`
 ```
 $ ./megacli
 
-MegaCLI v0.1.5
+MegaCLI v0.1.6
 Client MEGA en Rust - Download/Upload/Stream
 
 > Action
@@ -87,6 +88,19 @@ megacli --quota
 # Route everything through a proxy / VPN endpoint
 megacli "<lien>" -d ~/Formations --proxy socks5h://127.0.0.1:9050
 ```
+
+All of these are accepted for `<lien>`:
+
+```
+https://mega.nz/folder/<id>#<key>
+mega.nz/folder/<id>#<key>
+"https://mega.nz/folder/<id>#<key>".
+<https://mega.nz/folder/<id>#<key>>
+[lien](https://mega.nz/folder/<id>#<key>)
+```
+
+The shell quotes matter: paste the link **without** wrapping it yourself
+(`megacli "https://mega.nz/..."`), not `megacli "'[https://...](https://...)'"`.
 
 Exit codes: `0` success, `1` error, `2` MEGA quota reached (safe to relaunch later).
 Running it again with the same arguments skips finished files and resumes the others.
