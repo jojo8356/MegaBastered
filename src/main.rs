@@ -1013,13 +1013,6 @@ const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 /// How many different proxies are tried before giving up on finding a live one.
 const START_ATTEMPTS: usize = 25;
 
-/// How many proxies are probed at the same time.
-const CHECK_CONCURRENCY: usize = 32;
-/// Timeout for one probe.
-const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
-/// How many different proxies are tried before giving up on finding a live one.
-const START_ATTEMPTS: usize = 25;
-
 /// Probe every proxy of the list: can MEGA be reached, how fast, and how much
 /// quota is left on that exit IP. Only the working entries are printed, the
 /// alive ones can be written to a shorter list.
@@ -1164,7 +1157,7 @@ async fn select_start_proxy(
 
         let found = results.iter().find(|(_, outcome)| match outcome {
             Ok(()) => true,
-            Err(message) => is_quota_message(message),
+            Err(message) => is_quota_message(message.as_str()),
         });
 
         if let Some((index, _)) = found {
@@ -1181,7 +1174,8 @@ async fn select_start_proxy(
     Err(anyhow::anyhow!(
         "aucun des {} premiers proxies ne repond a MEGA.\
 \n  Lance \"--proxy-check-out working.txt\" pour trier la liste, \
-puis \"--proxy-file working.txt\"."
+puis \"--proxy-file working.txt\".",
+        candidates.len()
     ))
 }
 
