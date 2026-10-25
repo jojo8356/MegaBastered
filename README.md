@@ -50,7 +50,7 @@ Binary output: `target/release/megacli`
 ```
 $ ./megacli
 
-MegaCLI v0.1.6
+MegaCLI v0.1.7
 Client MEGA en Rust - Download/Upload/Stream
 
 > Action
@@ -87,7 +87,25 @@ megacli --quota
 
 # Route everything through a proxy / VPN endpoint
 megacli "<lien>" -d ~/Formations --proxy socks5h://127.0.0.1:9050
+
+# Same, for every run (used by the interactive menu too)
+export MEGACLI_PROXY=socks5h://127.0.0.1:9050
 ```
+
+Proxy URL schemes accepted: `http://`, `https://`, `socks5://`, `socks5h://`
+(and `socks4://`). Use **socks5h** when the proxy should resolve hostnames
+itself: the DNS query then never leaves your machine's side of the tunnel, so
+MEGA (and your ISP) cannot see which domain you resolve. With `socks5://` the
+name is resolved locally first.
+
+In the interactive menu: *Parametres -> 5. Changer le proxy*. The current proxy
+is shown in the header, and an invalid URL is refused instead of silently
+disabling networking.
+
+DNS itself has nothing to do with MEGA's quota: the limit follows the **exit IP**
+of your connection, not the resolver. Changing `/etc/resolv.conf` or macOS
+`networksetup -setdnsservers Wi-Fi 1.1.1.1 9.9.9.9` only changes who answers
+your DNS queries.
 
 All of these are accepted for `<lien>`:
 
