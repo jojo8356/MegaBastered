@@ -898,8 +898,8 @@ async fn file_len(path: &Path) -> u64 {
 /// Forget the resume index and start the file again from the first chunk.
 async fn reset_for_retry(shared: &Arc<Shared>, parts_path: &Path) -> Result<(), FileError> {
     {
-        let guard = shared.file.lock().await;
-        if let Some(file) = guard.as_ref() {
+        let mut guard = shared.file.lock().await;
+        if let Some(file) = guard.as_mut() {
             file.set_len(0)
                 .await
                 .map_err(|e| FileError::Other(format!("troncature: {}", e)))?;
