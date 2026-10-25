@@ -104,8 +104,9 @@ async fn menu_download_link(state: &mut AppState) {
     let mut config = state.download_config();
     config.workers = workers;
 
-    match api::get_free_quota(&state.client, state.session.as_ref().and_then(|s| s.sid.as_deref())).await {
-        Ok((used, total)) => println!(
+    let sid = state.session.as_ref().and_then(|s| s.sid.as_deref());
+    if let Ok((used, total)) = api::get_free_quota(&state.client, sid).await {
+        println!(
             "  Quota MEGA (cette IP): {} utilises{}",
             api::format_bytes(used),
             if total == 0 {
@@ -113,8 +114,7 @@ async fn menu_download_link(state: &mut AppState) {
             } else {
                 format!(" sur {}", api::format_bytes(total))
             }
-        ),
-        Err(_) => {}
+        );
     }
     println!();
 
