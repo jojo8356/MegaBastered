@@ -15,7 +15,15 @@ type Aes128Ctr = Ctr128BE<Aes128>;
 // --- Base64 ---
 
 pub fn url_base64_decode(data: &str) -> Result<Vec<u8>> {
-    Ok(general_purpose::URL_SAFE_NO_PAD.decode(data)?)
+    // MEGA mostly uses unpadded URL-safe base64, but keys coming from the API
+    // can also be padded or use the standard alphabet.
+    let trimmed = data.trim_end_matches('=');
+    if let Ok(bytes) = general_purpose::URL_SAFE_NO_PAD.decode(trimmed) {
+        return Ok(bytes);
+    }
+
+    let standard = trimmed.replace('-', "+").replace('_', "/");
+    Ok(general_purpose::STANDARD_NO_PAD.decode(standard)?)
 }
 
 pub fn url_base64_encode(data: &[u8]) -> String {

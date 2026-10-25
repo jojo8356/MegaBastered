@@ -689,3 +689,89 @@ pub fn format_bytes(bytes: u64) -> String {
     let val = bytes as f64 / (1u64 << (10 * exp)) as f64;
     format!("{:.2} {}", val, units[exp])
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::decrypt_node_key;
+    use crate::crypto::{
+        aes_ecb_encrypt, encrypt_mega_attr, node_aes_key, url_base64_encode,
+    };
+    use serde_json::json;
+
+    fn node_key(seed: u8) -> Vec<u8> {
+        (0..32u8)
+            .map(|i| i.wrapping_mul(11).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn node_key_is_decrypted_with_the_folder_key() {
+        let folder_key: Vec<u8> = (0..16u8).collect();
+        let key = node_key(5);
+        let wrapped = aes_ecb_encrypt(&key, &folder_key).unwrap();
+        let attributes =
+            encrypt_mega_attr(r#"{"n":"Module 1 - Creer sa boutique"}"#, &node_aes_key(&key))
+                .unwrap();
+
+        let entry = json!({
+            "h": "HANDLE1",
+            "k": format!("HANDLE1:{}", url_base64_encode(&wrapped)),
+            "a": url_base64_encode(&attributes),
+        });
+
+        let (decoded, name) = decrypt_node_key(&entry, &folder_key).expect("node key");
+        assert_eq!(decoded, url_base64_encode(&key));
+        assert_eq!(name.as_deref(), Some("Module 1 - Creer sa boutique"));
+    }
+
+    #[test]
+    fn multi_segment_keys_fall_back_to_the_valid_one() {
+        let folder_key: Vec<u8> = (0..16u8).collect();
+        let valid = node_key(7);
+        let other = node_key(99);
+
+        let wrapped_other = aes_ecb_encrypt(&other, &folder_key).unwrap();
+        let wrapped_valid = aes_ecb_encrypt(&valid, &folder_key).unwrap();
+        let attributes = encrypt_mega_attr(r#"{"n":"Module 2"}"#, &node_aes_key(&valid)).unwrap();
+
+        let entry = json!({
+            "h": "HANDLE2",
+            "k": format!(
+                "H1:{}/H2:{}",
+                url_base64_encode(&wrapped_other),
+                url_base64_encode(&wrapped_valid)
+            ),
+            "a": url_base64_encode(&attributes),
+        });
+
+        let (decoded, name) = decrypt_node_key(&entry, &folder_key).expect("node key");
+        assert_eq!(decoded, url_base64_encode(&valid));
+        assert_eq!(name.as_deref(), Some("Module 2"));
+    }
+
+    #[test]
+    fn node_without_attributes_keeps_its_key() {
+        let folder_key = [3u8; 16];
+        let key = node_key(9);
+        let wrapped = aes_ecb_encrypt(&key, &folder_key).unwrap();
+
+        let entry = json!({
+            "h": "HANDLE3",
+            "k": format!("HANDLE3:{}", url_base64_encode(&wrapped)),
+        });
+
+        let (decoded, name) = decrypt_node_key(&entry, &folder_key).expect("node key");
+        assert_eq!(decoded, url_base64_encode(&key));
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn node_without_key_is_ignored() {
+        let entry = json!({ "h": "HANDLE4", "a": "AAAA" });
+        assert!(decrypt_node_key(&entry, &[0u8; 16]).is_none());
+    }
+}

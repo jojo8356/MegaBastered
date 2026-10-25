@@ -296,15 +296,7 @@ async fn download_file(
         }
     }
 
-    let mut start_index = 0usize;
-    while start_index < chunks.len() && chunks[start_index].0 + chunks[start_index].1 <= on_disk {
-        start_index += 1;
-    }
-    let resume_at = if start_index < chunks.len() {
-        chunks[start_index].0
-    } else {
-        file_size
-    };
+    let (start_index, resume_at) = resume_plan(&chunks, file_size, on_disk);
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -611,6 +603,23 @@ async fn try_fetch_chunk(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Where to resume a partially downloaded file: index of the first incomplete
+/// chunk and the byte offset to restart from.
+fn resume_plan(chunks: &[(u64, u64)], file_size: u64, on_disk: u64) -> (usize, u64) {
+    let mut start_index = 0usize;
+    while start_index < chunks.len() && chunks[start_index].0 + chunks[start_index].1 <= on_disk {
+        start_index += 1;
+    }
+
+    let resume_at = if start_index < chunks.len() {
+        chunks[start_index].0
+    } else {
+        file_size
+    };
+
+    (start_index, resume_at)
+}
+
 /// Split a MEGA file into its (offset, size) chunks.
 fn build_chunks(file_size: u64) -> Vec<(u64, u64)> {
     let mut chunks = Vec::new();
@@ -783,5 +792,170 @@ impl Throttle {
                 tokio::time::sleep(Duration::from_secs_f64(wait)).await;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{build_chunks, derive_file_keys, resume_plan, resolve_paths, sanitize_file_name};
+    use crate::api::FileNode;
+    use crate::crypto::{forward_mega_link_key_iv, make_aes_ctr_cipher, url_base64_encode};
+    use ctr::cipher::StreamCipher;
+    use std::path::PathBuf;
+
+    fn node(handle: &str, parent: &str, node_type: i32, name: &str) -> FileNode {
+        FileNode {
+            handle: handle.to_string(),
+            parent: parent.to_string(),
+            node_type,
+            size: 0,
+            name: name.to_string(),
+            key: String::new(),
+        }
+    }
+
+    #[test]
+    fn chunks_are_contiguous_and_cover_the_file() {
+        let sizes = [
+            1u64,
+            1024,
+            131_071,
+            131_072,
+            131_073,
+            3 * 1024 * 1024,
+            (1024 * 1024) * 37 + 12_345,
+        ];
+
+        for size in sizes {
+            let chunks = build_chunks(size);
+            assert!(!chunks.is_empty(), "no chunk for size {}", size);
+            assert_eq!(chunks[0].0, 0, "first chunk must start at 0");
+
+            let mut expected_offset = 0u64;
+            for (offset, chunk_size) in &chunks {
+                assert_eq!(*offset, expected_offset, "gap in chunk plan for {}", size);
+                assert!(*chunk_size > 0);
+                expected_offset += chunk_size;
+            }
+
+            assert_eq!(expected_offset, size, "chunks do not cover the file");
+        }
+    }
+
+    #[test]
+    fn chunk_plan_follows_the_mega_table() {
+        let chunks = build_chunks(3 * 1024 * 1024);
+        let offsets: Vec<u64> = chunks.iter().map(|(offset, _)| *offset).collect();
+        assert_eq!(
+            offsets,
+            vec![0, 131_072, 393_216, 786_432, 1_310_720, 1_966_080, 2_752_512]
+        );
+
+        let sizes: Vec<u64> = chunks.iter().map(|(_, size)| *size).collect();
+        assert_eq!(
+            sizes,
+            vec![131_072, 262_144, 393_216, 524_288, 655_360, 786_432, 393_216]
+        );
+    }
+
+    #[test]
+    fn per_chunk_decryption_matches_a_single_stream() {
+        // 32 byte node key (two 16 byte halves XOR-ed together by MEGA).
+        let raw_key: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
+        let key_b64 = url_base64_encode(&raw_key);
+        let (aes_key, aes_iv) = derive_file_keys(&key_b64).unwrap();
+        assert_eq!(aes_key.len(), 16);
+        assert_eq!(aes_iv.len(), 16);
+
+        let size = 3 * 1024 * 1024 + 12_345u64;
+        let plaintext: Vec<u8> = (0..size)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+
+        // What MEGA stores: the whole file encrypted as one CTR stream.
+        let mut ciphertext = plaintext.clone();
+        make_aes_ctr_cipher(&aes_key, &aes_iv).apply_keystream(&mut ciphertext);
+
+        // What we download: independent chunks, each decrypted at its offset.
+        let mut decrypted = vec![0u8; size as usize];
+        for (offset, chunk_size) in build_chunks(size) {
+            let iv = forward_mega_link_key_iv(&aes_iv, offset);
+            let range = offset as usize..(offset + chunk_size) as usize;
+            let mut buffer = ciphertext[range.clone()].to_vec();
+            make_aes_ctr_cipher(&aes_key, &iv).apply_keystream(&mut buffer);
+            decrypted[range].copy_from_slice(&buffer);
+        }
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn keys_are_xor_folded_like_mega_links() {
+        let raw_key: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(5).wrapping_add(1)).collect();
+        let key_b64 = url_base64_encode(&raw_key);
+        let (aes_key, aes_iv) = derive_file_keys(&key_b64).unwrap();
+
+        let expected_key: Vec<u8> = (0..16).map(|i| raw_key[i] ^ raw_key[i + 16]).collect();
+        assert_eq!(aes_key, expected_key);
+        assert_eq!(aes_iv[..8], raw_key[16..24]);
+        assert_eq!(aes_iv[8..], [0u8; 8]);
+    }
+
+    #[test]
+    fn resume_only_restarts_unfinished_chunks() {
+        let chunks = build_chunks(3 * 1024 * 1024);
+
+        assert_eq!(resume_plan(&chunks, 3 * 1024 * 1024, 0), (0, 0));
+
+        // First chunk fully written, second one partial.
+        assert_eq!(resume_plan(&chunks, 3 * 1024 * 1024, 131_072 + 1000), (1, 131_072));
+
+        // Everything is on disk: nothing left to do.
+        assert_eq!(
+            resume_plan(&chunks, 3 * 1024 * 1024, 3 * 1024 * 1024),
+            (chunks.len(), 3 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn paths_rebuild_the_folder_tree() {
+        let nodes = vec![
+            node("ROOT", "", 2, "Yas Sab - Dropshipping Revolution"),
+            node("D1", "ROOT", 1, "Module 1"),
+            node("D2", "D1", 1, "Sous-dossier"),
+            node("F1", "ROOT", 0, "racine.pdf"),
+            node("F2", "D1", 0, "video.mp4"),
+            node("F3", "D2", 0, "notes.txt"),
+            node("F4", "INCONNU", 0, "orphelin.txt"),
+        ];
+
+        let paths = resolve_paths(&nodes, "ROOT");
+
+        assert_eq!(paths.get("F1"), Some(&PathBuf::from("racine.pdf")));
+        assert_eq!(
+            paths.get("F2"),
+            Some(&PathBuf::from("Module 1").join("video.mp4"))
+        );
+        assert_eq!(
+            paths.get("F3"),
+            Some(&PathBuf::from("Module 1").join("Sous-dossier").join("notes.txt"))
+        );
+        // Unknown parent: keep the file at the root instead of losing it.
+        assert_eq!(paths.get("F4"), Some(&PathBuf::from("orphelin.txt")));
+        // The shared folder itself is never part of a path.
+        assert_eq!(paths.get("ROOT"), None);
+    }
+
+    #[test]
+    fn file_names_are_sanitized() {
+        assert_eq!(sanitize_file_name("Module 1 - Creer sa boutique"), "Module 1 - Creer sa boutique");
+        assert_eq!(sanitize_file_name("a/b\\c:d*e?f\"g<h>i|j"), "a_b_c_d_e_f_g_h_i_j");
+        assert_eq!(sanitize_file_name("   "), "sans_nom");
+        assert_eq!(sanitize_file_name(".."), "sans_nom");
+        assert_eq!(sanitize_file_name("ligne\nbrisee"), "ligne_nbrisee");
     }
 }
