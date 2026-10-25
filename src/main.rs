@@ -35,12 +35,17 @@ fn clear() {
 }
 
 fn pause() {
-    let _: String = Input::new()
-        .with_prompt("Appuie sur Entree pour continuer")
+    let answer: String = Input::new()
+        .with_prompt("Appuie sur Entree pour continuer  (q = quitter)")
         .allow_empty(true)
         .default(String::new())
         .interact_text()
         .unwrap_or_default();
+
+    if answer.trim().eq_ignore_ascii_case("q") {
+        println!("Bye!");
+        std::process::exit(0);
+    }
 }
 
 fn ask(prompt: &str) -> String {

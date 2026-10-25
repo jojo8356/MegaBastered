@@ -14,7 +14,8 @@ No Java, no Electron, no bloat. Just a single binary that handles downloads, upl
 - **Folder downloads** - Download a whole public folder (or sub-folder): tree is recreated, every file is decrypted with its own node key, already downloaded files are skipped
 - **Resumable transfers** - Per-chunk index (`.megacli.parts`): an interrupted download resumes exactly where it stopped, and a partial file is never reported as complete
 - **Quota aware** - HTTP 509 (MEGA transfer quota) stops the run cleanly and can wait/resume on its own (`--quota-wait`)
-- **Scriptable CLI** - `megacli <link>` to download, `megacli --list <link>` to inspect a folder
+- **Scriptable CLI** - `megacli <link>` to download, `megacli --list <link> [-d dest]` to see what is already done
+- **Instant re-runs** - a concurrent pre-scan of the destination lists what is already complete, those files are never touched again and their leftovers are cleaned
 - **Quota monitoring** - Check storage usage and remaining space
 - **Directory creation** - Create folders in your MEGA cloud
 - **Progress bars** - Real-time download/upload progress with speed and ETA
@@ -47,7 +48,7 @@ Binary output: `target/release/megacli`
 ```
 $ ./megacli
 
-MegaCLI v0.1.0
+MegaCLI v0.1.3
 Client MEGA en Rust - Download/Upload/Stream
 
 > Action
@@ -63,11 +64,15 @@ Client MEGA en Rust - Download/Upload/Stream
   0. Quitter
 ```
 
+`q` (or Escape) quits from the main menu, and `q` at any "press Enter"
+prompt exits the app. Same idea in the sub-menus: `q` goes back.
+
 ### Command line (scriptable, no menu)
 
 ```bash
-# Inspect a folder: paths, sizes, number of quota sessions needed
-megacli --list "https://mega.nz/folder/<id>#<key>"
+# Inspect a folder: every file with [ok] / [reprendre] / [manquant],
+# plus the remaining volume and an estimate of quota sessions
+megacli --list "https://mega.nz/folder/<id>#<key>" -d ~/Documents/Formations
 
 # Download everything (resumes on the next run)
 megacli "https://mega.nz/folder/<id>#<key>" -d ~/Documents/Formations -w 8
@@ -91,6 +96,9 @@ What this client does about it:
   hammering the remaining files) with the remaining volume and a resume hint;
 - everything already downloaded is kept, `.megacli.parts` records the completed
   chunks so the next run only fetches what is missing;
+- the next run starts with a verification pass: finished files (size matches) are
+  skipped without a single API call, stale `.megacli.tmp`/`.megacli.parts` are
+  removed, and only missing or partial files are queued;
 - `--quota-wait <minutes>` (menu: *Parametres → 4*) pauses and retries
   automatically instead of stopping;
 - a paid MEGA plan raises the limit (its quota is per account, not per IP).
