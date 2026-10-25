@@ -956,6 +956,6 @@ mod tests {
         assert_eq!(sanitize_file_name("a/b\\c:d*e?f\"g<h>i|j"), "a_b_c_d_e_f_g_h_i_j");
         assert_eq!(sanitize_file_name("   "), "sans_nom");
         assert_eq!(sanitize_file_name(".."), "sans_nom");
-        assert_eq!(sanitize_file_name("ligne\nbrisee"), "ligne_nbrisee");
+        assert_eq!(sanitize_file_name("ligne\nbrisee"), "ligne_brisee");
     }
 }
