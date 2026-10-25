@@ -515,7 +515,7 @@ async fn main() -> Result<()> {
 
     loop {
         clear();
-        println!("{}", title.apply_to("MegaCLI v0.1.0"));
+        println!("{}", title.apply_to(format!("MegaCLI v{}", env!("CARGO_PKG_VERSION"))));
         println!(
             "{}",
             dim.apply_to("Client MEGA en Rust - Download/Upload/Stream")
