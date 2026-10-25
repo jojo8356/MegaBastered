@@ -12,7 +12,9 @@ No Java, no Electron, no bloat. Just a single binary that handles downloads, upl
 - **Account management** - Login with email/password, 2FA support, session handling
 - **Cloud file browser** - List files in tree view with handles for easy reference
 - **Folder downloads** - Download a whole public folder (or sub-folder): tree is recreated, every file is decrypted with its own node key, already downloaded files are skipped
-- **Resumable transfers** - Interrupted downloads restart where they stopped (`.megacli.tmp`)
+- **Resumable transfers** - Per-chunk index (`.megacli.parts`): an interrupted download resumes exactly where it stopped, and a partial file is never reported as complete
+- **Quota aware** - HTTP 509 (MEGA transfer quota) stops the run cleanly and can wait/resume on its own (`--quota-wait`)
+- **Scriptable CLI** - `megacli <link>` to download, `megacli --list <link>` to inspect a folder
 - **Quota monitoring** - Check storage usage and remaining space
 - **Directory creation** - Create folders in your MEGA cloud
 - **Progress bars** - Real-time download/upload progress with speed and ETA
@@ -61,6 +63,41 @@ Client MEGA en Rust - Download/Upload/Stream
   0. Quitter
 ```
 
+### Command line (scriptable, no menu)
+
+```bash
+# Inspect a folder: paths, sizes, number of quota sessions needed
+megacli --list "https://mega.nz/folder/<id>#<key>"
+
+# Download everything (resumes on the next run)
+megacli "https://mega.nz/folder/<id>#<key>" -d ~/Documents/Formations -w 8
+
+# Same, but wait 30 min and continue automatically when MEGA's quota hits
+megacli "https://mega.nz/folder/<id>#<key>" -d ~/Documents/Formations -q 30
+```
+
+Exit codes: `0` success, `1` error, `2` MEGA quota reached (safe to relaunch later).
+Running it again with the same arguments skips finished files and resumes the others.
+
+### MEGA transfer quota (HTTP 509)
+
+MEGA limits how much a **free** account / anonymous visitor can download: roughly
+**5 GB per rolling 6-hour window, per IP address** ([MEGA Help](https://help.mega.io/plans-storage/space-storage/transfer-quota)).
+A 30 GB folder therefore needs several sessions spread over a day or two.
+
+What this client does about it:
+
+- HTTP 509 is detected per chunk and the whole run stops immediately (no point
+  hammering the remaining files) with the remaining volume and a resume hint;
+- everything already downloaded is kept, `.megacli.parts` records the completed
+  chunks so the next run only fetches what is missing;
+- `--quota-wait <minutes>` (menu: *Parametres → 4*) pauses and retries
+  automatically instead of stopping;
+- a paid MEGA plan raises the limit (its quota is per account, not per IP).
+
+The client does not rotate proxies/VPNs to farm free quota: that is against
+MEGA's terms of service.
+
 ### Download a public link
 
 Paste any `mega.nz` link (file or folder). Supports both old (`#!`, `#F!`) and new
@@ -85,10 +122,12 @@ Requires a logged-in account. Files are encrypted client-side before upload with
 ### Resume / partial downloads
 
 While a file is downloading, data is written to `<name>.megacli.tmp` next to the
-final file. If the process is interrupted (Ctrl+C, network drop, MEGA quota), run
-the same command again: completed chunks are detected from the temp file size and
-only the missing ones are fetched. A short recap is printed at the end of a folder
-download (downloaded / already present / failed).
+final file, and every finished chunk offset is appended to
+`<name>.megacli.parts`. If the process is interrupted (Ctrl+C, network drop, MEGA
+quota), run the same command again: the sidecar tells exactly which chunks are
+already on disk, the others are fetched, and the file is renamed only once it is
+complete and the right size. A short recap is printed at the end of a folder
+download (downloaded / already present / failed / quota reached).
 
 ### Stream media
 
@@ -124,8 +163,8 @@ cargo test
 ```
 
 Unit tests cover the MEGA chunk layout, per-chunk AES-CTR decryption against a
-single stream, node-key unwrapping (including multi-segment imported keys),
-resume planning and folder path rebuilding.
+single stream, node-key unwrapping (including multi-segment imported keys), the
+resume sidecar, quota error detection and folder path rebuilding.
 
 `.github/workflows/ci.yml` runs `cargo check`, `cargo test`, `cargo clippy` and a
 release build on every push.
