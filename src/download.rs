@@ -1317,7 +1317,7 @@ mod tests {
         // Every character Windows refuses in a file name becomes "_".
         let dirty = format!("a/b{c}d:e*f?g", c = '\\');
         let dirty = format!("{dirty}\"h<i>j|k");
-        assert_eq!(sanitize_file_name(&dirty), "a_b_c_d_e_f_g_h_i_j_k");
+        assert_eq!(sanitize_file_name(&dirty), "a_b_d_e_f_g_h_i_j_k");
 
         assert_eq!(sanitize_file_name("   "), "sans_nom");
         assert_eq!(sanitize_file_name(".."), "sans_nom");
