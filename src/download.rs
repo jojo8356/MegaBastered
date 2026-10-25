@@ -294,7 +294,7 @@ pub async fn download_folder(
     let mut failures: Vec<(String, String)> = Vec::new();
 
     for (position, index) in pending.iter().enumerate() {
-        let (node, relative) = files[*index];
+        let (node, relative) = &files[*index];
         let dest = base.join(relative);
         println!(
             "\n  [{}/{}] {} ({})",
