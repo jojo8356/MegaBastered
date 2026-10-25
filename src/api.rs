@@ -442,12 +442,15 @@ fn parse_quota(object: &Value) -> QuotaInfo {
         .map(|values| values.iter().filter_map(|value| value.as_u64()).collect())
         .unwrap_or_default();
 
+    // MEGA splits the account transfer usage in an "own" part (`caxfer`, or
+    // `tuo` on older responses) and a "served from my links" part (`csxfer` /
+    // `tua`); the SDK adds them, so do we.
     let mut info = QuotaInfo {
         storage_used: field(object, &["cstrg"]),
         storage_max: field(object, &["mstrg"]),
         transfer_max: field(object, &["mxfer"]),
-        transfer_used: field(object, &["caxfer", "tuo"]),
-        transfer_served: field(object, &["csxfer", "tua"]),
+        transfer_used: field(object, &["caxfer"]) + field(object, &["tuo"]),
+        transfer_served: field(object, &["csxfer"]) + field(object, &["tua"]),
         transfer_reserved: field(object, &["tar"]),
         ip_buckets,
         bucket_age: object["bt"].as_u64(),
