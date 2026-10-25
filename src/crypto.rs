@@ -59,6 +59,9 @@ pub fn i32a_to_bin(values: &[i32]) -> Vec<u8> {
 // --- AES-ECB ---
 
 pub fn aes_ecb_encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    if key.len() < 16 {
+        return Err(anyhow!("cle AES trop courte ({} octets)", key.len()));
+    }
     let key_arr: [u8; 16] = key[..16].try_into()?;
     let mut cipher = Aes128::new(&key_arr.into());
     let mut result = data.to_vec();
@@ -73,6 +76,9 @@ pub fn aes_ecb_encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn aes_ecb_decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    if key.len() < 16 {
+        return Err(anyhow!("cle AES trop courte ({} octets)", key.len()));
+    }
     let key_arr: [u8; 16] = key[..16].try_into()?;
     let mut cipher = Aes128::new(&key_arr.into());
     let mut result = data.to_vec();
@@ -88,6 +94,9 @@ pub fn aes_ecb_decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 // --- AES-CBC ---
 
 pub fn aes_cbc_encrypt_nopadding(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
+    if key.len() < 16 || iv.len() < 16 {
+        return Err(anyhow!("cle/IV AES invalide"));
+    }
     let mut buf = data.to_vec();
     let padded_len = ((buf.len() + 15) / 16) * 16;
     buf.resize(padded_len, 0);
@@ -98,6 +107,9 @@ pub fn aes_cbc_encrypt_nopadding(data: &[u8], key: &[u8], iv: &[u8]) -> Result<V
 }
 
 pub fn aes_cbc_decrypt_nopadding(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
+    if key.len() < 16 || iv.len() < 16 {
+        return Err(anyhow!("cle/IV AES invalide"));
+    }
     let mut buf = data.to_vec();
     let pt = Aes128CbcDec::new(key[..16].into(), iv[..16].into())
         .decrypt_padded_mut::<NoPadding>(&mut buf)
@@ -154,6 +166,12 @@ pub fn make_aes_ctr_cipher(key: &[u8], iv: &[u8]) -> Aes128Ctr {
 
 pub fn init_mega_link_key(key_string: &str) -> Result<Vec<u8>> {
     let raw = url_base64_decode(key_string)?;
+    if raw.len() < 32 {
+        return Err(anyhow!(
+            "cle de lien trop courte ({} octets au lieu de 32)",
+            raw.len()
+        ));
+    }
     let int_key = bin_to_i32a(&raw);
     if int_key.len() < 8 {
         return Err(anyhow!("Invalid key length"));
@@ -396,5 +414,43 @@ pub fn gen_chunk_url(file_url: &str, file_size: u64, offset: u64, chunk_size: u6
         format!("{}/{}", file_url, offset)
     } else {
         format!("{}/{}-{}", file_url, offset, offset + chunk_size - 1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_variants_are_decoded() {
+        let bytes = [1u8, 2, 3, 250];
+        let encoded = url_base64_encode(&bytes);
+        assert_eq!(url_base64_decode(&encoded).unwrap(), bytes);
+        // Some MEGA fields come padded.
+        assert_eq!(url_base64_decode(&format!("{}=", encoded)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn short_keys_are_rejected_instead_of_panicking() {
+        assert!(aes_ecb_decrypt(&[0u8; 16], &[0u8; 8]).is_err());
+        assert!(aes_ecb_encrypt(&[0u8; 16], &[0u8; 8]).is_err());
+        assert!(aes_cbc_decrypt_nopadding(&[0u8; 16], &[0u8; 8], &[0u8; 16]).is_err());
+        assert!(init_mega_link_key("AAAA").is_err());
+        assert!(init_mega_link_key_iv("AAAA").is_err());
+    }
+
+    #[test]
+    fn node_key_is_folded_for_legacy_and_modern_keys() {
+        let modern: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(3)).collect();
+        let folded = node_aes_key(&modern);
+        assert_eq!(folded.len(), 16);
+        assert_eq!(folded[0], modern[0] ^ modern[16]);
+
+        let legacy: Vec<u8> = (0..16u8).collect();
+        assert_eq!(node_aes_key(&legacy), legacy);
     }
 }

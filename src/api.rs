@@ -665,8 +665,14 @@ pub fn extract_n_folder_id(link: &str) -> Result<String> {
 
 pub fn extract_folder_id_and_key(link: &str) -> Result<(String, String)> {
     let link = normalize_mega_link(link);
-    let re = regex::Regex::new(r"#F!([^!]+)!([^!#\s]+)")?;
-    let caps = re.captures(&link).ok_or(anyhow!("Cannot parse folder link"))?;
+    // A new style link can point at a sub-folder:
+    // `https://mega.nz/folder/<id>#<key>/folder/<sub-id>`. The key never
+    // contains a slash, so stopping there keeps the key valid (the whole
+    // folder is then downloaded).
+    let re = regex::Regex::new(r"#F!([^!]+)!([^!#\s/]+)")?;
+    let caps = re
+        .captures(&link)
+        .ok_or(anyhow!("lien de dossier invalide"))?;
     Ok((caps[1].to_string(), caps[2].to_string()))
 }
 
@@ -696,7 +702,7 @@ pub fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::decrypt_node_key;
+    use super::{decrypt_node_key, extract_folder_id_and_key};
     use crate::crypto::{
         aes_ecb_encrypt, encrypt_mega_attr, node_aes_key, url_base64_encode,
     };
@@ -773,5 +779,22 @@ mod tests {
     fn node_without_key_is_ignored() {
         let entry = json!({ "h": "HANDLE4", "a": "AAAA" });
         assert!(decrypt_node_key(&entry, &[0u8; 16]).is_none());
+    }
+
+    #[test]
+    fn folder_links_are_parsed() {
+        let (id, key) =
+            extract_folder_id_and_key("https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw")
+                .unwrap();
+        assert_eq!(id, "2wkxkQAB");
+        assert_eq!(key, "IbHZz1kP9KvTp9uTJ2iOLw");
+
+        // Sub-folder link: keep the folder key and ignore the selection.
+        let (id, key) = extract_folder_id_and_key(
+            "https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw/folder/AbCdEfGh",
+        )
+        .unwrap();
+        assert_eq!(id, "2wkxkQAB");
+        assert_eq!(key, "IbHZz1kP9KvTp9uTJ2iOLw");
     }
 }

@@ -958,4 +958,19 @@ mod tests {
         assert_eq!(sanitize_file_name(".."), "sans_nom");
         assert_eq!(sanitize_file_name("ligne\nbrisee"), "ligne_brisee");
     }
+
+    #[test]
+    fn padded_node_keys_are_accepted() {
+        let raw_key: Vec<u8> = (0..32u8).collect();
+        let padded = format!("{}=", url_base64_encode(&raw_key));
+        let (key, iv) = derive_file_keys(&padded).expect("padded key");
+        assert_eq!(key.len(), 16);
+        assert_eq!(iv.len(), 16);
+    }
+
+    #[test]
+    fn invalid_node_keys_are_rejected() {
+        assert!(derive_file_keys("AAAA").is_err());
+        assert!(derive_file_keys("").is_err());
+    }
 }
