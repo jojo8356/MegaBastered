@@ -49,7 +49,7 @@ Binary output: `target/release/megacli`
 ```
 $ ./megacli
 
-MegaCLI v0.1.4
+MegaCLI v0.1.5
 Client MEGA en Rust - Download/Upload/Stream
 
 > Action
@@ -90,6 +90,48 @@ megacli "<lien>" -d ~/Formations --proxy socks5h://127.0.0.1:9050
 
 Exit codes: `0` success, `1` error, `2` MEGA quota reached (safe to relaunch later).
 Running it again with the same arguments skips finished files and resumes the others.
+
+### How MEGA's quota actually works
+
+Two independent counters, both visible with `megacli --quota` (`a:"uq"`, `v:2`):
+
+| Counter | Fields | Who is limited |
+|---|---|---|
+| **Storage** | `cstrg` / `mstrg` | the account (20 GB free, more with Pro) |
+| **Transfer** | paid: `mxfer`, `caxfer`+`tuo`, `csxfer`+`tua` | the account, monthly |
+| | free: `tah` (6 hourly buckets), `bt` (bucket age), `tar` (reserved) | the **IP address**, rolling 6 h |
+
+The free transfer limit is not a fixed daily cap: MEGA stores it as **six hourly
+buckets** (that is literally the `tah` array in the API) and ages them out
+(`bt`). That is why the quota frees up progressively, not at midnight.
+
+MEGA documents the decision rule for a download very precisely: the request is
+refused with `EOVERQUOTA (-17)` when
+
+```
+usage of the last 5-6 hours (per IP)
+  + remaining size of all downloads still running
+  + size of the file you are asking for
+  > the current per-IP limit
+```
+
+Consequences worth knowing:
+
+- downloading **one file at a time** is more quota-efficient than many in
+  parallel, because every running download reserves its remaining size — this
+  client already downloads folder entries sequentially;
+- a refused download can be interrupted mid-transfer: the storage servers answer
+  **HTTP 509**, which is the same decision at the CDN level;
+- a file only starts counting once it has been **transferred in full more than 10
+  times** (partial transfers count proportionally): rare links cost almost
+  nothing, popular public links burn the quota fast;
+- **streaming counts** as transfer, uploads do not (they consume storage);
+- MEGA discards incomplete server-side transfers after 48 h of inactivity.
+
+Paid plans switch the limit to the account (Pro Lite: 1 TB/month, usable
+immediately), and a paying user can **grant a share of their transfer quota** to
+whoever downloads their links (25 % by default) — that is the only official way
+for a link's recipients to avoid the 509.
 
 ### MEGA transfer quota (HTTP 509)
 
