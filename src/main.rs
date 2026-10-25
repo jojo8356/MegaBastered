@@ -18,9 +18,24 @@ struct AppState {
     speed_limit: u64,
     /// How long to pause when MEGA answers HTTP 509 (0 = do not wait).
     quota_wait: std::time::Duration,
+    /// Optional HTTP/SOCKS5 proxy used for every MEGA request.
+    proxy: Option<String>,
 }
 
 impl AppState {
+    fn proxy_label(&self) -> String {
+        match &self.proxy {
+            Some(url) => url.clone(),
+            None => "aucun (connexion directe)".to_string(),
+        }
+    }
+
+    /// Rebuild the HTTP client after a proxy change.
+    fn apply_proxy(&mut self) -> Result<()> {
+        self.client = build_client(self.proxy.as_deref())?;
+        Ok(())
+    }
+
     fn download_config(&self) -> download::DownloadConfig {
         download::DownloadConfig {
             workers: self.workers,
@@ -471,6 +486,7 @@ async fn menu_settings(state: &mut AppState) {
             format!("{} min", state.quota_wait.as_secs() / 60)
         }
     );
+    println!("  5. Proxy (HTTP/SOCKS5):       {}", state.proxy_label());
     println!();
 
     let choices = &[
@@ -478,16 +494,17 @@ async fn menu_settings(state: &mut AppState) {
         "Changer connexions paralleles",
         "Changer limite de vitesse",
         "Changer attente quota 509",
+        "Changer le proxy (HTTP/SOCKS5)",
         "Retour",
     ];
     let sel = Select::new()
         .with_prompt("Modifier  (q pour revenir)")
         .items(choices)
-        .default(4)
+        .default(5)
         .interact_opt()
         .ok()
         .flatten()
-        .unwrap_or(4);
+        .unwrap_or(5);
 
     match sel {
         0 => {
@@ -508,6 +525,31 @@ async fn menu_settings(state: &mut AppState) {
                 &current.to_string(),
             );
             state.quota_wait = std::time::Duration::from_secs(s.parse::<u64>().unwrap_or(0) * 60);
+        }
+        4 => {
+            println!();
+            println!("  Exemples:");
+            println!("    socks5h://127.0.0.1:9050   (Tor, DNS resolu par le proxy)");
+            println!("    socks5://127.0.0.1:1080    (SSH -D, DNS resolu en local)");
+            println!("    http://127.0.0.1:8080      (proxy HTTP)");
+            println!("  Vide = connexion directe.");
+            println!();
+            let input = ask_default("Proxy", state.proxy.as_deref().unwrap_or(""));
+            let cleaned = input.trim().to_string();
+            let previous = state.proxy.clone();
+            state.proxy = if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            };
+
+            if let Err(e) = state.apply_proxy() {
+                println!("\n  Proxy refuse: {}", e);
+                state.proxy = previous;
+                let _ = state.apply_proxy();
+            } else {
+                println!("\n  Proxy actif: {}", state.proxy_label());
+            }
         }
         _ => {}
     }
@@ -679,6 +721,14 @@ fn default_download_dir() -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
+/// Proxy configured through MEGACLI_PROXY, if any.
+fn env_proxy() -> Option<String> {
+    std::env::var("MEGACLI_PROXY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn build_client(proxy: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder().timeout(std::time::Duration::from_secs(120));
 
@@ -797,7 +847,8 @@ async fn run_cli(args: CliArgs) -> Result<()> {
     let mut args = args;
     args.link = api::clean_link_input(&args.link);
 
-    let client = build_client(args.proxy.as_deref())?;
+    let proxy = args.proxy.clone().or_else(env_proxy);
+    let client = build_client(proxy.as_deref())?;
 
     if args.quota_only {
         print_quota(&client, None).await?;
@@ -908,11 +959,12 @@ async fn main() -> Result<()> {
         return run_cli(args).await;
     }
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
+    // Proxy can come from the environment (handy for scripts and the menu).
+    let proxy = env_proxy();
+    let client = build_client(proxy.as_deref())?;
 
     let mut state = AppState {
+        proxy,
         client,
         session: None,
         download_path: default_download_dir(),
@@ -947,6 +999,9 @@ async fn main() -> Result<()> {
         if let Some(ref s) = state.session {
             println!("{}", Style::new().green().apply_to(format!("Connecte: {}", s.email)));
         }
+        if let Some(ref proxy) = state.proxy {
+            println!("{}", dim.apply_to(format!("Proxy: {}", proxy)));
+        }
         println!();
 
         let sel = Select::new()
@@ -977,3 +1032,32 @@ async fn main() -> Result<()> {
 }
 
 const DEFAULT_WORKERS: usize = 6;
+
+#[cfg(test)]
+mod tests {
+    use super::{build_client, describe_quota};
+    use crate::api::QuotaInfo;
+
+    #[test]
+    fn invalid_proxy_is_rejected() {
+        assert!(build_client(Some("pas-une-url")).is_err());
+        assert!(build_client(Some("socks5h://127.0.0.1:9050")).is_ok());
+        assert!(build_client(None).is_ok());
+    }
+
+    #[test]
+    fn quota_report_mentions_the_ip_window() {
+        let info = QuotaInfo {
+            ip_buckets: vec![1_000_000_000, 500_000_000],
+            bucket_age: Some(1800),
+            storage_used: 10,
+            storage_max: 20,
+            ..QuotaInfo::default()
+        };
+
+        let lines = describe_quota(&info);
+        let joined = lines.join("\n");
+        assert!(joined.contains("fenetre glissante de 6 h"), "{}", joined);
+        assert!(joined.contains("Stockage"), "{}", joined);
+    }
+}
