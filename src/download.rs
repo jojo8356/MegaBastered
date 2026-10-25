@@ -298,9 +298,10 @@ async fn download_file(
 
     let (start_index, resume_at) = resume_plan(&chunks, file_size, on_disk);
 
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(&temp_path)
         .await?;
     if file.metadata().await?.len() != resume_at {

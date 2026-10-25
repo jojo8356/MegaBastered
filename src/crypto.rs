@@ -43,7 +43,7 @@ pub fn base64_encode(data: &[u8]) -> String {
 // --- i32 array <-> bytes (big-endian, MEGA style) ---
 
 pub fn bin_to_i32a(bin: &[u8]) -> Vec<i32> {
-    let padded_len = ((bin.len() + 3) / 4) * 4;
+    let padded_len = bin.len().div_ceil(4) * 4;
     let mut padded = vec![0u8; padded_len];
     padded[..bin.len()].copy_from_slice(bin);
     padded
@@ -66,7 +66,7 @@ pub fn aes_ecb_encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     let mut cipher = Aes128::new(&key_arr.into());
     let mut result = data.to_vec();
     // Pad to 16 bytes
-    let padded_len = ((result.len() + 15) / 16) * 16;
+    let padded_len = result.len().div_ceil(16) * 16;
     result.resize(padded_len, 0);
     for chunk in result.chunks_mut(16) {
         let block = aes::Block::from_mut_slice(chunk);
@@ -82,7 +82,7 @@ pub fn aes_ecb_decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     let key_arr: [u8; 16] = key[..16].try_into()?;
     let mut cipher = Aes128::new(&key_arr.into());
     let mut result = data.to_vec();
-    let padded_len = ((result.len() + 15) / 16) * 16;
+    let padded_len = result.len().div_ceil(16) * 16;
     result.resize(padded_len, 0);
     for chunk in result.chunks_mut(16) {
         let block = aes::Block::from_mut_slice(chunk);
@@ -98,7 +98,7 @@ pub fn aes_cbc_encrypt_nopadding(data: &[u8], key: &[u8], iv: &[u8]) -> Result<V
         return Err(anyhow!("cle/IV AES invalide"));
     }
     let mut buf = data.to_vec();
-    let padded_len = ((buf.len() + 15) / 16) * 16;
+    let padded_len = buf.len().div_ceil(16) * 16;
     buf.resize(padded_len, 0);
     let ct = Aes128CbcEnc::new(key[..16].into(), iv[..16].into())
         .encrypt_padded_mut::<NoPadding>(&mut buf, padded_len)
@@ -344,7 +344,7 @@ pub fn extract_rsa_priv_key(rsa_data: &[u8]) -> Result<[BigUint; 4]> {
             return Err(anyhow!("RSA key data too short"));
         }
         let bit_len = 256 * (rsa_data[offset] as usize & 0xFF) + (rsa_data[offset + 1] as usize & 0xFF);
-        let byte_len = (bit_len + 7) / 8;
+        let byte_len = bit_len.div_ceil(8);
         let l = byte_len + 2;
         if offset + l > rsa_data.len() {
             return Err(anyhow!("RSA key data too short at component"));
@@ -379,7 +379,7 @@ pub fn decrypt_mega_attr(enc_attr: &str, key: &[u8]) -> Result<serde_json::Value
 pub fn encrypt_mega_attr(attr_json: &str, key: &[u8]) -> Result<Vec<u8>> {
     let zero_iv = [0u8; 16];
     let attr_bytes = format!("MEGA{}", attr_json).into_bytes();
-    let padded_len = ((attr_bytes.len() + 15) / 16) * 16;
+    let padded_len = attr_bytes.len().div_ceil(16) * 16;
     let mut padded = vec![0u8; padded_len];
     padded[..attr_bytes.len()].copy_from_slice(&attr_bytes);
     aes_cbc_encrypt_nopadding(&padded, key, &zero_iv)
@@ -397,7 +397,7 @@ pub fn calculate_chunk_offset(chunk_id: u64, size_multi: u64) -> u64 {
 }
 
 pub fn calculate_chunk_size(chunk_id: u64, file_size: u64, offset: u64, size_multi: u64) -> u64 {
-    let chunk_size = if chunk_id >= 1 && chunk_id <= 7 {
+    let chunk_size = if (1..=7).contains(&chunk_id) {
         chunk_id * 128 * 1024
     } else {
         1024 * 1024 * size_multi

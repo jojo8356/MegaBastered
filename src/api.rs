@@ -207,7 +207,7 @@ pub async fn login(client: &Client, email: &str, password: &str, pincode: Option
         // Legacy login
         let _key_bytes = email.to_lowercase().as_bytes().to_vec();
         // Pad to multiple of 4 for i32a
-        let key_i32 = bin_to_i32a(&password.as_bytes().to_vec());
+        let key_i32 = bin_to_i32a(password.as_bytes());
         let pkey = mega_prepare_master_key(&key_i32)?;
         let uh = mega_user_hash(email.to_lowercase().as_bytes(), &pkey)?;
         (pkey.to_vec(), uh)
