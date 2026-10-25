@@ -61,7 +61,7 @@ jobs:
           status=$?
           if [ $status -ne 0 ]; then
             sed -e 's/\x1b\[[0-9;]*m//g' clippy.log \
-              | grep -E "(^error|^warning|error\[|warning\[)" \
+              | grep -E "(error|warning)(\[|:)" \
               | while IFS= read -r line; do echo "::error::$line"; done
             tail -40 clippy.log
             exit $status
