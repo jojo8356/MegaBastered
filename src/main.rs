@@ -669,6 +669,10 @@ struct CliArgs {
     proxy_file: Option<String>,
     /// Probe every proxy of the list and exit.
     proxy_check: bool,
+    /// Write the proxies that answered to this file.
+    proxy_check_out: Option<String>,
+    /// Stop the check once this many proxies answered (0 = whole list).
+    proxy_check_stop: usize,
     /// How the first proxy is picked.
     proxy_mode: proxy::ProxyMode,
 }
@@ -695,6 +699,8 @@ puis reprendre au lieu de s'arreter (defaut: 0)\n  \
                           (1.2.3.4:8080, *1.2.3.4:1080, socks5://h:p,\n  \
                            user:pass@h:p, h:p@base64(user:pass))\n  \
       --proxy-check       teste chaque proxy de la liste (latence + quota)\n  \
+      --proxy-check-out <f>  ecrit les proxies qui repondent dans <f>\n  \
+      --proxy-check-stop <n> s'arrete apres n proxies valides (0 = toute la liste)\n  \
       --proxy-mode <m>    first | random (defaut: first)\n  \
   -h, --help              cette aide\n\n\
 Codes de sortie: 0 succes, 1 erreur, 2 quota MEGA atteint (relancer plus tard).",
@@ -718,6 +724,8 @@ fn parse_cli() -> Option<CliArgs> {
     let mut proxy: Option<String> = None;
     let mut proxy_file: Option<String> = None;
     let mut proxy_check = false;
+    let mut proxy_check_out: Option<String> = None;
+    let mut proxy_check_stop = 0usize;
     let mut proxy_mode = proxy::ProxyMode::First;
     let mut quota_only = false;
 
@@ -740,6 +748,17 @@ fn parse_cli() -> Option<CliArgs> {
                 proxy_file = args.get(index).cloned();
             }
             "--proxy-check" => proxy_check = true,
+            "--proxy-check-out" => {
+                index += 1;
+                proxy_check_out = args.get(index).cloned();
+            }
+            "--proxy-check-stop" => {
+                index += 1;
+                proxy_check_stop = args
+                    .get(index)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+            }
             "--proxy-mode" => {
                 index += 1;
                 match args.get(index).and_then(|value| proxy::ProxyMode::parse(value)) {
@@ -806,6 +825,8 @@ fn parse_cli() -> Option<CliArgs> {
         proxy,
         proxy_file,
         proxy_check,
+        proxy_check_out,
+        proxy_check_stop,
         proxy_mode,
     })
 }
@@ -845,7 +866,6 @@ fn build_client(proxy: Option<&str>) -> Result<Client> {
         let proxy = reqwest::Proxy::all(url)
             .map_err(|e| anyhow::anyhow!("proxy invalide ({}): {}", url, e))?;
         builder = builder.proxy(proxy);
-        println!("Proxy: {}", url);
     }
 
     Ok(builder.build()?)
@@ -986,10 +1006,30 @@ fn short_proxy(url: &str) -> String {
     label
 }
 
+/// How many proxies are probed at the same time.
+const CHECK_CONCURRENCY: usize = 32;
+/// Timeout for one probe.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How many different proxies are tried before giving up on finding a live one.
+const START_ATTEMPTS: usize = 25;
+
+/// How many proxies are probed at the same time.
+const CHECK_CONCURRENCY: usize = 32;
+/// Timeout for one probe.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How many different proxies are tried before giving up on finding a live one.
+const START_ATTEMPTS: usize = 25;
+
 /// Probe every proxy of the list: can MEGA be reached, how fast, and how much
-/// quota is left on that exit IP.
-async fn check_proxies(entries: &[proxy::ProxyEntry]) -> Result<()> {
+/// quota is left on that exit IP. Only the working entries are printed, the
+/// alive ones can be written to a shorter list.
+async fn check_proxies(
+    entries: &[proxy::ProxyEntry],
+    out: Option<&str>,
+    stop_after: usize,
+) -> Result<()> {
     use futures::stream::{self, StreamExt};
+    use indicatif::{ProgressBar, ProgressStyle};
 
     if entries.is_empty() {
         println!("Aucun proxy a verifier (--proxy-file ou MEGACLI_PROXY_FILE).");
@@ -997,84 +1037,152 @@ async fn check_proxies(entries: &[proxy::ProxyEntry]) -> Result<()> {
     }
 
     println!(
-        "  Verification de {} proxy(ies), 8 en parallele...\n",
-        entries.len()
+        "  {} proxy(ies), {} testes en parallele, {} s max par proxy.",
+        entries.len(),
+        CHECK_CONCURRENCY,
+        CHECK_TIMEOUT.as_secs()
     );
 
+    let pb = ProgressBar::new(entries.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template("  {bar:30.cyan/blue} {pos}/{len}  OK: {msg}  ETA {eta}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=>-"),
+    );
+    pb.set_message("0");
+
+    // (index in the list, quota used on that exit IP, latency)
+    let mut working: Vec<(usize, u64, std::time::Duration)> = Vec::new();
     let mut checks = stream::iter(entries.iter().enumerate().map(|(index, entry)| async move {
         let started = std::time::Instant::now();
         let outcome = match build_client(Some(&entry.url)) {
             Ok(client) => {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(20),
-                    api::get_quota_info(&client, None),
-                )
-                .await
-                {
-                    Ok(Ok(info)) => Ok((info, started.elapsed())),
+                match tokio::time::timeout(CHECK_TIMEOUT, api::get_quota_info(&client, None)).await {
+                    Ok(Ok(info)) => Ok((info.ip_transfer_used(), started.elapsed())),
                     Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err("timeout (20s)".to_string()),
+                    Err(_) => Err(format!("timeout ({}s)", CHECK_TIMEOUT.as_secs())),
                 }
             }
             Err(e) => Err(e.to_string()),
         };
-        (index, entry, outcome)
+        (index, outcome)
     }))
-    .buffer_unordered(8)
-    .collect::<Vec<_>>()
-    .await;
+    .buffer_unordered(CHECK_CONCURRENCY);
 
-    checks.sort_by_key(|(index, _, _)| *index);
-
-    let mut working = 0usize;
-    let mut best: Option<(usize, u64)> = None;
-
-    for (index, entry, outcome) in &checks {
-        match outcome {
-            Ok((info, elapsed)) => {
-                working += 1;
-                let used = info.ip_transfer_used();
-                let better = match best {
-                    Some((_, best_used)) => used < best_used,
-                    None => true,
-                };
-                if better {
-                    best = Some((*index, used));
-                }
+    while let Some((index, outcome)) = checks.next().await {
+        if let Ok((used, elapsed)) = outcome {
+            working.push((index, used, elapsed));
+            pb.set_message(working.len().to_string());
+            let url = &entries[index].url;
+            pb.suspend(|| {
                 println!(
-                    "  {:>3}. {:<42} OK    {:>9} utilises (IP)   {:>5} ms",
-                    index + 1,
-                    short_proxy(&entry.url),
+                    "  OK    {:<40} {:>9} utilises (IP)   {:>5} ms   [{}]",
+                    short_proxy(url),
                     api::format_bytes(used),
-                    elapsed.as_millis()
+                    elapsed.as_millis(),
+                    index + 1
                 );
-            }
-            Err(error) => {
-                println!(
-                    "  {:>3}. {:<42} ECHEC {}",
-                    index + 1,
-                    short_proxy(&entry.url),
-                    error
-                );
-            }
+            });
+        }
+
+        pb.inc(1);
+        if stop_after > 0 && working.len() >= stop_after {
+            break;
         }
     }
 
+    pb.finish_and_clear();
+
+    working.sort_by_key(|(_, used, _)| *used);
     println!(
-        "\n  {}/{} proxy(ies) repondent a MEGA.",
-        working,
+        "\n  {} proxy(ies) sur {} repondent a MEGA.",
+        working.len(),
         entries.len()
     );
-    if let Some((index, used)) = best {
+    if let Some((index, used, _)) = working.first() {
         println!(
-            "  Le moins consomme: {} ({} utilises sur sa fenetre de 6 h) -> numero {}",
-            short_proxy(&entries[index].url),
-            api::format_bytes(used),
+            "  Le moins consomme: {} - {} utilises sur sa fenetre de 6 h (numero {})",
+            short_proxy(&entries[*index].url),
+            api::format_bytes(*used),
             index + 1
         );
+    } else {
+        println!("  Aucun proxy de cette liste ne repond: essaie une autre liste.");
+    }
+
+    if let Some(path) = out {
+        let mut content = String::from("# megacli --proxy-check: proxies qui repondent a MEGA\n");
+        for (index, _, _) in &working {
+            content.push_str(&entries[*index].url);
+            content.push('\n');
+        }
+        std::fs::write(path, content)
+            .map_err(|e| anyhow::anyhow!("impossible d'ecrire {}: {}", path, e))?;
+        println!("  {} proxy(ies) ecrits dans {}", working.len(), path);
     }
 
     Ok(())
+}
+
+/// Pick a starting proxy that actually answers, trying a few entries of the
+/// list. Only *unreachable* proxies are skipped: a proxy that answers but has no
+/// quota left is selected and reported, never dodged by hopping to the next one.
+async fn select_start_proxy(
+    proxies: &[proxy::ProxyEntry],
+    mode: proxy::ProxyMode,
+) -> Result<(usize, Client)> {
+    const BATCH: usize = 8;
+
+    let len = proxies.len();
+    let start = proxy::pick_index(mode, len);
+    let candidates: Vec<usize> = (0..len.min(START_ATTEMPTS))
+        .map(|step| (start + step) % len)
+        .collect();
+
+    for batch in candidates.chunks(BATCH) {
+        let mut probes = Vec::with_capacity(batch.len());
+        for &index in batch {
+            let entry = &proxies[index];
+            probes.push(async move {
+                let outcome = match build_client(Some(&entry.url)) {
+                    Ok(client) => {
+                        match tokio::time::timeout(CHECK_TIMEOUT, api::get_quota_info(&client, None))
+                            .await
+                        {
+                            Ok(Ok(_)) => Ok(()),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_) => Err(format!("timeout ({}s)", CHECK_TIMEOUT.as_secs())),
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                (index, outcome)
+            });
+        }
+
+        let results = futures::future::join_all(probes).await;
+
+        let found = results.iter().find(|(_, outcome)| match outcome {
+            Ok(()) => true,
+            Err(message) => is_quota_message(message),
+        });
+
+        if let Some((index, _)) = found {
+            let client = build_client(Some(&proxies[*index].url))?;
+            return Ok((*index, client));
+        }
+
+        println!(
+            "  {} proxy(ies) injoignable(s), on essaie les suivants...",
+            results.len()
+        );
+    }
+
+    Err(anyhow::anyhow!(
+        "aucun des {} premiers proxies ne repond a MEGA.\
+\n  Lance \"--proxy-check-out working.txt\" pour trier la liste, \
+puis \"--proxy-file working.txt\"."
+    ))
 }
 
 /// True when an error message is about MEGA's transfer quota.
@@ -1090,7 +1198,12 @@ async fn run_cli(args: CliArgs) -> Result<()> {
     let proxies = resolve_proxies(&args)?;
 
     if args.proxy_check {
-        return check_proxies(&proxies).await;
+        return check_proxies(
+            &proxies,
+            args.proxy_check_out.as_deref(),
+            args.proxy_check_stop,
+        )
+        .await;
     }
 
     if args.quota_only {
@@ -1115,16 +1228,24 @@ async fn run_cli(args: CliArgs) -> Result<()> {
     };
 
     // --- Run -----------------------------------------------------------------
-    let index = if proxies.is_empty() {
-        0
+    // With a list, the starting exit is verified first: a dead entry would
+    // otherwise abort before a single byte is downloaded.
+    let (index, client) = if proxies.len() > 1 {
+        select_start_proxy(&proxies, args.proxy_mode).await?
     } else {
-        proxy::pick_index(args.proxy_mode, proxies.len())
+        let client = build_client(proxies.first().map(|entry| entry.url.as_str()))?;
+        (0, client)
     };
-    let entry = proxies.get(index);
-    let client = build_client(entry.map(|entry| entry.url.as_str()))?;
 
-    if let Some(entry) = entry {
-        println!("  Proxy {}/{}: {}", index + 1, proxies.len(), entry.url);
+    if proxies.len() > 1 {
+        println!(
+            "  Proxy {}/{}: {}",
+            index + 1,
+            proxies.len(),
+            proxies[index].url
+        );
+    } else if let Some(entry) = proxies.first() {
+        println!("  Proxy: {}", entry.url);
     }
 
     print_quota(&client, None).await?;
@@ -1387,6 +1508,16 @@ mod tests {
         assert!(is_quota_message("HTTP 509 transfer quota exceeded"));
         assert!(is_quota_message("Quota MEGA atteint"));
         assert!(!is_quota_message("connection refused"));
+    }
+
+    #[test]
+    fn proxy_labels_are_shortened() {
+        use super::short_proxy;
+
+        assert_eq!(short_proxy("http://1.2.3.4:80"), "http://1.2.3.4:80");
+        let long = short_proxy(&format!("http://user:password@{}.example.com:8080", "a".repeat(40)));
+        assert_eq!(long.len(), 42);
+        assert!(long.ends_with("..."));
     }
 
     #[test]

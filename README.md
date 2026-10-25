@@ -121,19 +121,33 @@ user:pass@9.9.9.9:3128       proxy with credentials
 # Which proxies work, and how much quota is left on each exit IP?
 ./megacli --proxy-file proxies.txt --proxy-check
 
+# Same, but keep only the ones that answer, in a smaller list
+./megacli --proxy-file proxies.txt --proxy-check-out proxies-ok.txt
+./megacli "<lien>" -d ~/Documents/Formations --proxy-file proxies-ok.txt
+
 # Or export it once for every run (CLI and interactive menu)
 export MEGACLI_PROXY_FILE=~/proxies.txt
 ```
 
-`--proxy-check` asks MEGA for the transfer quota **through each proxy** and
-prints latency plus the bytes already used on that exit IP, so you can pick the
-least-loaded exit. Duplicate lines and malformed lines are dropped (up to 5000
-entries are read).
+`--proxy-check` asks MEGA for the transfer quota **through each proxy** (32 at a
+time, 8 s max each) and prints latency plus the bytes already used on that exit
+IP, so you can pick the least-loaded exit. `--proxy-check-out <file>` writes the
+entries that answered, ready to be fed back to `--proxy-file`, and
+`--proxy-check-stop <n>` stops as soon as `n` proxies answered. Duplicate lines
+and malformed lines are dropped (up to 5000 entries are read).
+
+Free lists are mostly dead: expect a handful of survivors out of a thousand
+lines, which is exactly why the `--proxy-check-out` filter exists. Checking is
+never done during a download.
 
 Rules kept on purpose:
 
 - **one** exit is chosen at startup (`--proxy-mode first|random`), then the whole
   run uses it - the client never jumps from proxy to proxy mid-download;
+- if that entry is unreachable, the next few lines of the list are tried *before*
+  anything is downloaded (25 entries max, 8 at a time), and the run starts on the
+  first one that answers MEGA. A proxy that answers but has **no quota left** is
+  not skipped: the run stops and says so;
 - when MEGA answers 509, the run stops with exit code `2` and prints another
   entry of your list to continue with;
 - `--proxy` / `MEGACLI_PROXY` win over the list file (one explicit proxy).
