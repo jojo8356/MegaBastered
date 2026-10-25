@@ -700,6 +700,7 @@ puis reprendre au lieu de s'arreter (defaut: 0)\n  \
                            user:pass@h:p, h:p@base64(user:pass))\n  \
       --proxy-check       teste chaque proxy de la liste (latence + quota)\n  \
       --proxy-check-out <f>  ecrit les proxies qui repondent dans <f>\n  \
+                          (implique --proxy-check)\n  \
       --proxy-check-stop <n> s'arrete apres n proxies valides (0 = toute la liste)\n  \
       --proxy-mode <m>    first | random (defaut: first)\n  \
   -h, --help              cette aide\n\n\
@@ -809,21 +810,11 @@ fn parse_cli() -> Option<CliArgs> {
         index += 1;
     }
 
-    // Guard rails: a silently ignored proxy flag led to a direct-IP download
-    // while the user thought they were proxied.
-    if proxy_check_out.is_some() && !proxy_check {
-        eprintln!("--proxy-check-out enregistre le resultat de --proxy-check (les proxies qui repondent).");
-        if proxy_file.is_some() || std::env::var("MEGACLI_PROXY_FILE").is_ok() {
-            eprintln!("Ajoute --proxy-check pour filtrer la liste, ou retire --proxy-check-out pour telecharger.");
-        } else {
-            eprintln!("Pour telecharger via une liste de proxies, utilise --proxy-file <fichier>.");
-        }
-        eprintln!("Rien n'a ete telecharge.");
-        std::process::exit(1);
-    }
-    if proxy_check_stop > 0 && !proxy_check {
-        eprintln!("--proxy-check-stop va avec --proxy-check. Rien n'a ete telecharge.");
-        std::process::exit(1);
+    // `--proxy-check-out` only makes sense with `--proxy-check`: asking for the
+    // file is asking for the check, so imply it instead of failing.
+    if (proxy_check_out.is_some() || proxy_check_stop > 0) && !proxy_check {
+        proxy_check = true;
+        println!("--proxy-check-out implique --proxy-check.");
     }
     if proxy_mode_set
         && proxy_file.is_none()

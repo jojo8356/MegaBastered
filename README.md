@@ -122,6 +122,7 @@ user:pass@9.9.9.9:3128       proxy with credentials
 ./megacli --proxy-file proxies.txt --proxy-check
 
 # Same, but keep only the ones that answer, in a smaller list
+# (--proxy-check-out implies --proxy-check)
 ./megacli --proxy-file proxies.txt --proxy-check-out proxies-ok.txt
 ./megacli "<lien>" -d ~/Documents/Formations --proxy-file proxies-ok.txt
 
@@ -132,7 +133,8 @@ export MEGACLI_PROXY_FILE=~/proxies.txt
 `--proxy-check` asks MEGA for the transfer quota **through each proxy** (32 at a
 time, 8 s max each) and prints latency plus the bytes already used on that exit
 IP, so you can pick the least-loaded exit. `--proxy-check-out <file>` writes the
-entries that answered, ready to be fed back to `--proxy-file`, and
+entries that answered, ready to be fed back to `--proxy-file` (it implies
+`--proxy-check`), and
 `--proxy-check-stop <n>` stops as soon as `n` proxies answered. Duplicate lines
 and malformed lines are dropped (up to 5000 entries are read).
 
