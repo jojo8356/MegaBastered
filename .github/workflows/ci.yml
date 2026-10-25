@@ -44,7 +44,8 @@ jobs:
           if [ $status -ne 0 ]; then
             # Surface the failures as annotations (job logs are not always
             # reachable from automation).
-            grep -E "(panicked at|assertion|left:|right:|^thread |^---- |^test .* FAILED)" test-output.log \
+            sed -e 's/\x1b\[[0-9;]*m//g' test-output.log \
+              | grep -E "(panicked at|assertion|left:|right:|^thread |^---- |^test .* FAILED)" \
               | head -80 \
               | while IFS= read -r line; do echo "::error::$line"; done
             tail -30 test-output.log
@@ -59,7 +60,8 @@ jobs:
           cargo clippy --all-targets -- -D warnings > clippy.log 2>&1
           status=$?
           if [ $status -ne 0 ]; then
-            grep -E "^(error|warning)" clippy.log | head -40 \
+            sed -e 's/\x1b\[[0-9;]*m//g' clippy.log \
+              | grep -E "(^error|^warning|error\[|warning\[)" \
               | while IFS= read -r line; do echo "::error::$line"; done
             tail -40 clippy.log
             exit $status
