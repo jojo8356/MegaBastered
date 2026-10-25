@@ -727,6 +727,7 @@ fn parse_cli() -> Option<CliArgs> {
     let mut proxy_check_out: Option<String> = None;
     let mut proxy_check_stop = 0usize;
     let mut proxy_mode = proxy::ProxyMode::First;
+    let mut proxy_mode_set = false;
     let mut quota_only = false;
 
     let mut index = 0usize;
@@ -762,7 +763,10 @@ fn parse_cli() -> Option<CliArgs> {
             "--proxy-mode" => {
                 index += 1;
                 match args.get(index).and_then(|value| proxy::ProxyMode::parse(value)) {
-                    Some(mode) => proxy_mode = mode,
+                    Some(mode) => {
+                        proxy_mode = mode;
+                        proxy_mode_set = true;
+                    }
                     None => {
                         eprintln!("Mode invalide (first | random)");
                         std::process::exit(1);
@@ -803,6 +807,29 @@ fn parse_cli() -> Option<CliArgs> {
         }
 
         index += 1;
+    }
+
+    // Guard rails: a silently ignored proxy flag led to a direct-IP download
+    // while the user thought they were proxied.
+    if proxy_check_out.is_some() && !proxy_check {
+        eprintln!("--proxy-check-out enregistre le resultat de --proxy-check (les proxies qui repondent).");
+        if proxy_file.is_some() || std::env::var("MEGACLI_PROXY_FILE").is_ok() {
+            eprintln!("Ajoute --proxy-check pour filtrer la liste, ou retire --proxy-check-out pour telecharger.");
+        } else {
+            eprintln!("Pour telecharger via une liste de proxies, utilise --proxy-file <fichier>.");
+        }
+        eprintln!("Rien n'a ete telecharge.");
+        std::process::exit(1);
+    }
+    if proxy_check_stop > 0 && !proxy_check {
+        eprintln!("--proxy-check-stop va avec --proxy-check. Rien n'a ete telecharge.");
+        std::process::exit(1);
+    }
+    if proxy_mode_set
+        && proxy_file.is_none()
+        && std::env::var("MEGACLI_PROXY_FILE").is_err()
+    {
+        eprintln!("Attention: --proxy-mode sans --proxy-file n'a aucun effet (proxy unique ou direct).");
     }
 
     let link = match link {
@@ -1240,6 +1267,8 @@ async fn run_cli(args: CliArgs) -> Result<()> {
         );
     } else if let Some(entry) = proxies.first() {
         println!("  Proxy: {}", entry.url);
+    } else {
+        println!("  Connexion directe (aucun proxy) : le quota est celui de ton IP.");
     }
 
     print_quota(&client, None).await?;
