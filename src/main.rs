@@ -66,22 +66,31 @@ async fn menu_download_link(state: &mut AppState) {
 
     let path = ask_default("Dossier destination", &state.download_path);
     let workers_str = ask_default("Connexions paralleles", &state.workers.to_string());
-    let workers: usize = workers_str.parse().unwrap_or(state.workers);
+    let workers: usize = workers_str.parse().unwrap_or(state.workers).clamp(1, 20);
+    let folder = api::is_folder_link(&link);
 
+    if folder {
+        println!("\n  Dossier public detecte - arborescence complete");
+    }
+    println!("  Destination: {}", path);
+    println!("  Connexions:  {}", workers);
     println!();
 
-    if api::is_folder_link(&link) {
-        match download::download_folder(&state.client, &link, &path, workers).await {
-            Ok(()) => println!("\n  Dossier telecharge!"),
-            Err(e) => println!("\n  Erreur: {}", e),
-        }
+    let result = if folder {
+        download::download_folder(&state.client, &link, &path, workers, state.speed_limit).await
     } else {
-        match download::download_from_link(&state.client, &link, &path, workers, state.speed_limit)
-            .await
-        {
-            Ok(()) => println!("\n  Telechargement termine!"),
-            Err(e) => println!("\n  Erreur: {}", e),
+        download::download_from_link(&state.client, &link, &path, workers, state.speed_limit).await
+    };
+
+    match result {
+        Ok(()) => {
+            if folder {
+                println!("\n  Dossier telecharge!");
+            } else {
+                println!("\n  Telechargement termine!");
+            }
         }
+        Err(e) => println!("\n  Erreur: {}", e),
     }
 
     pause();

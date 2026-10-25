@@ -1,200 +1,483 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use ctr::cipher::StreamCipher;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use std::time::{Duration, Instant};
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::api;
 use crate::crypto::*;
 
+/// Size of the big MEGA chunks, in MiB (used by the chunk size algorithm).
 const CHUNK_SIZE_MULTI: u64 = 20;
+const MAX_WORKERS: usize = 20;
+const MAX_RETRIES: u32 = 8;
+/// Suffix of the in-progress file. Kept as `.tmp` so it is git/tooling friendly
+/// and easy to spot when cleaning up.
+const TEMP_SUFFIX: &str = ".megacli.tmp";
 
-/// Download a file from a MEGA link with multi-connection
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+/// Download a file (or a whole folder) from a public MEGA link.
 pub async fn download_from_link(
     client: &Client,
     link: &str,
     dest_dir: &str,
     workers: usize,
-    _speed_limit: u64, // KiB/s, 0 = unlimited
+    speed_limit: u64,
 ) -> Result<()> {
-    let link = api::normalize_mega_link(link);
+    if api::is_folder_link(link) {
+        return download_folder(client, link, dest_dir, workers, speed_limit).await;
+    }
 
-    // Get metadata
+    let link = api::normalize_mega_link(link);
     let (filename, file_size, file_key) = api::get_file_metadata(client, &link, None).await?;
+    let dl_url = api::get_file_download_url(client, &link, None).await?;
+
     println!("  Fichier: {}", filename);
     println!("  Taille:  {}", api::format_bytes(file_size));
 
-    // Get download URL
-    let dl_url = api::get_file_download_url(client, &link, None).await?;
-
-    // Prepare keys
-    let aes_key = init_mega_link_key(&file_key)?;
-    let aes_iv = init_mega_link_key_iv(&file_key)?;
-
-    // Output file
-    let dest_path = Path::new(dest_dir).join(&filename);
-    let temp_path = dest_path.with_extension("megacli.tmp");
-
-    let num_workers = workers.min(20).max(1);
-
-    // Calculate all chunks
-    let mut chunks = Vec::new();
-    let mut chunk_id = 1u64;
-    loop {
-        let offset = calculate_chunk_offset(chunk_id, CHUNK_SIZE_MULTI);
-        if offset >= file_size {
-            break;
-        }
-        let size = calculate_chunk_size(chunk_id, file_size, offset, CHUNK_SIZE_MULTI);
-        chunks.push((chunk_id, offset, size));
-        chunk_id += 1;
-    }
-
-    // Progress bar
-    let pb = ProgressBar::new(file_size);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "  {bar:40.cyan/blue} {percent}% {bytes}/{total_bytes} [{bytes_per_sec}] ETA {eta}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
-
-    // Pre-allocate output file
+    let dest = Path::new(dest_dir).join(sanitize_file_name(&filename));
+    if download_file(
+        client,
+        &dl_url,
+        file_size,
+        &file_key,
+        &dest,
+        workers,
+        speed_limit,
+    )
+    .await?
     {
-        let f = File::create(&temp_path).await?;
-        f.set_len(file_size).await?;
+        println!("\n  Sauvegarde: {}", dest.display());
+    } else {
+        println!("\n  Deja present: {}", dest.display());
     }
 
-    // Shared state
-    let chunk_index = Arc::new(AtomicU64::new(0));
-    let failed = Arc::new(AtomicBool::new(false));
-    let output_file = Arc::new(Mutex::new(
-        OpenOptions::new()
-            .write(true)
-            .open(&temp_path)
-            .await?,
-    ));
-
-    let chunks = Arc::new(chunks);
-    let dl_url = Arc::new(dl_url);
-    let aes_key = Arc::new(aes_key);
-    let aes_iv = Arc::new(aes_iv);
-    let pb = Arc::new(pb);
-
-    // Spawn workers
-    let mut handles = Vec::new();
-    for _worker_id in 0..num_workers {
-        let chunk_index = chunk_index.clone();
-        let failed = failed.clone();
-        let output_file = output_file.clone();
-        let chunks = chunks.clone();
-        let dl_url = dl_url.clone();
-        let aes_key = aes_key.clone();
-        let aes_iv = aes_iv.clone();
-        let pb = pb.clone();
-        let client = client.clone();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                if failed.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let idx = chunk_index.fetch_add(1, Ordering::SeqCst) as usize;
-                if idx >= chunks.len() {
-                    break;
-                }
-
-                let (chunk_id, offset, size) = chunks[idx];
-                let url = gen_chunk_url(&dl_url, file_size, offset, size);
-
-                let mut retries = 0;
-                loop {
-                    match download_chunk(&client, &url, size).await {
-                        Ok(encrypted_data) => {
-                            // Decrypt with AES-CTR
-                            let iv = forward_mega_link_key_iv(&aes_iv, offset);
-                            let mut cipher = make_aes_ctr_cipher(&aes_key, &iv);
-                            let mut decrypted = encrypted_data;
-                            cipher.apply_keystream(&mut decrypted);
-
-                            // Write to file at correct offset
-                            {
-                                let mut file = output_file.lock().await;
-                                use tokio::io::AsyncSeekExt;
-                                file.seek(std::io::SeekFrom::Start(offset)).await.ok();
-                                if let Err(e) = file.write_all(&decrypted).await {
-                                    eprintln!("\n  Erreur ecriture chunk {}: {}", chunk_id, e);
-                                    failed.store(true, Ordering::Relaxed);
-                                    break;
-                                }
-                            }
-
-                            pb.inc(size);
-                            break;
-                        }
-                        Err(e) => {
-                            retries += 1;
-                            if retries > 10 {
-                                eprintln!("\n  Erreur chunk {} apres {} tentatives: {}", chunk_id, retries, e);
-                                failed.store(true, Ordering::Relaxed);
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_secs(retries.min(8))).await;
-                        }
-                    }
-                }
-            }
-        });
-        handles.push(handle);
-    }
-
-    // Wait for all workers
-    for h in handles {
-        h.await?;
-    }
-
-    pb.finish_with_message("done");
-
-    if failed.load(Ordering::Relaxed) {
-        // Clean up temp file
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(anyhow!("Download echoue"));
-    }
-
-    // Rename temp to final
-    if dest_path.exists() {
-        tokio::fs::remove_file(&dest_path).await?;
-    }
-    tokio::fs::rename(&temp_path, &dest_path).await?;
-
-    println!("  Sauvegarde: {}", dest_path.display());
     Ok(())
 }
 
-async fn download_chunk(client: &Client, url: &str, expected_size: u64) -> Result<Vec<u8>> {
-    let resp = client
+/// Download every file of a public MEGA folder, recreating the directory tree.
+pub async fn download_folder(
+    client: &Client,
+    link: &str,
+    dest_dir: &str,
+    workers: usize,
+    speed_limit: u64,
+) -> Result<()> {
+    let (folder_id, folder_key) = api::extract_folder_id_and_key(link)?;
+
+    println!("  Chargement du contenu du dossier...");
+    let nodes = api::get_folder_nodes(client, &folder_id, &folder_key).await?;
+
+    if nodes.is_empty() {
+        return Err(anyhow!(
+            "Dossier vide ou inaccessible - verifie que le lien est toujours valide"
+        ));
+    }
+
+    let paths = resolve_paths(&nodes, &folder_id);
+    let base = Path::new(dest_dir);
+    tokio::fs::create_dir_all(base).await?;
+
+    // Recreate every folder, including the empty ones.
+    let mut directories = 0usize;
+    for node in nodes.iter().filter(|n| n.is_folder()) {
+        if let Some(rel) = paths.get(&node.handle) {
+            let dir = base.join(rel);
+            if tokio::fs::create_dir_all(&dir).await.is_ok() {
+                directories += 1;
+            }
+        }
+    }
+
+    // Files, with their destination path.
+    let files: Vec<(&api::FileNode, PathBuf)> = nodes
+        .iter()
+        .filter(|n| n.is_file())
+        .map(|n| {
+            let rel = match paths.get(&n.handle) {
+                Some(path) => path.clone(),
+                None => PathBuf::from(sanitize_file_name(&n.name)),
+            };
+            (n, rel)
+        })
+        .collect();
+
+    let total_size: u64 = files.iter().map(|(node, _)| node.size).sum();
+    println!(
+        "  {} fichier(s), {} dossier(s), {} au total",
+        files.len(),
+        directories,
+        api::format_bytes(total_size)
+    );
+    println!("  Destination: {}", base.display());
+
+    if files.is_empty() {
+        println!("\n  Aucun fichier a telecharger (dossiers vides crees).");
+        return Ok(());
+    }
+
+    let started = Instant::now();
+    let mut downloaded = 0usize;
+    let mut skipped = 0usize;
+    let mut skipped_bytes = 0u64;
+    let mut done_bytes = 0u64;
+    let mut failures: Vec<(String, String)> = Vec::new();
+
+    for (index, (node, rel)) in files.iter().enumerate() {
+        let dest = base.join(rel);
+        println!(
+            "\n  [{}/{}] {} ({})",
+            index + 1,
+            files.len(),
+            rel.display(),
+            api::format_bytes(node.size)
+        );
+
+        if node.key.is_empty() {
+            println!("  Echec: cle de dechiffrement indisponible");
+            failures.push((rel.display().to_string(), "cle indisponible".to_string()));
+            continue;
+        }
+
+        // Get a fresh download URL for this node. MEGA URLs are short lived so
+        // they are requested right before the transfer.
+        let mut dl_url = String::new();
+        let mut last_error = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(attempt as u64 * 2)).await;
+            }
+            match api::get_node_download_url(client, &folder_id, &node.handle).await {
+                Ok(url) => {
+                    dl_url = url;
+                    last_error.clear();
+                    break;
+                }
+                Err(e) => last_error = e.to_string(),
+            }
+        }
+        if dl_url.is_empty() {
+            println!("  Echec: {}", last_error);
+            failures.push((rel.display().to_string(), last_error));
+            continue;
+        }
+
+        match download_file(
+            client,
+            &dl_url,
+            node.size,
+            &node.key,
+            &dest,
+            workers,
+            speed_limit,
+        )
+        .await
+        {
+            Ok(true) => {
+                downloaded += 1;
+                done_bytes += node.size;
+            }
+            Ok(false) => {
+                skipped += 1;
+                skipped_bytes += node.size;
+                println!("  Deja present, ignore");
+            }
+            Err(e) => {
+                println!("  Echec: {}", e);
+                failures.push((rel.display().to_string(), e.to_string()));
+            }
+        }
+    }
+
+    // --- Recap ---
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let average_speed = done_bytes as f64 / elapsed;
+
+    println!("\n  ------------------------------------------------");
+    println!(
+        "  Termine en {} - {} telecharge(s), {} deja present(s), {} en echec",
+        format_duration(started.elapsed()),
+        downloaded,
+        skipped,
+        failures.len()
+    );
+    if done_bytes > 0 {
+        println!(
+            "  {} telecharges a {} ({} moyen)",
+            api::format_bytes(done_bytes),
+            format_speed(average_speed),
+            format_duration(started.elapsed())
+        );
+    }
+    if skipped_bytes > 0 {
+        println!("  {} deja sur le disque", api::format_bytes(skipped_bytes));
+    }
+
+    if !failures.is_empty() {
+        println!("\n  Fichiers en echec:");
+        for (path, error) in failures.iter().take(20) {
+            println!("    - {}: {}", path, error);
+        }
+        if failures.len() > 20 {
+            println!("    ... et {} autre(s)", failures.len() - 20);
+        }
+        println!("\n  Relance le meme lien pour reprendre les fichiers manquants.");
+        return Err(anyhow!("{} fichier(s) en echec", failures.len()));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Download engine
+// ---------------------------------------------------------------------------
+
+/// Download one file into `dest_path`.
+///
+/// Returns `Ok(true)` when the file was downloaded, `Ok(false)` when it was
+/// already complete on disk. Interrupted downloads are kept in a `.megacli.tmp`
+/// file and resumed on the next run (only the incomplete part is fetched again).
+async fn download_file(
+    client: &Client,
+    dl_url: &str,
+    file_size: u64,
+    file_key: &str,
+    dest_path: &Path,
+    workers: usize,
+    speed_limit: u64,
+) -> Result<bool> {
+    // Already there?
+    if let Ok(meta) = tokio::fs::metadata(dest_path).await {
+        if meta.is_file() && meta.len() == file_size {
+            return Ok(false);
+        }
+    }
+
+    if let Some(parent) = dest_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let file_name = dest_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "fichier".to_string());
+    let temp_path = dest_path.with_file_name(format!("{}{}", file_name, TEMP_SUFFIX));
+
+    if file_size == 0 {
+        tokio::fs::write(dest_path, b"").await?;
+        return Ok(true);
+    }
+
+    let (aes_key, aes_iv) = derive_file_keys(file_key)?;
+    let chunks = build_chunks(file_size);
+    let workers = workers.clamp(1, MAX_WORKERS);
+
+    // --- Resume support -----------------------------------------------------
+    // The temp file is only ever written at real chunk offsets, so its length
+    // tells us how many bytes were fully written. A partially written chunk is
+    // re-downloaded from its start.
+    let mut on_disk = 0u64;
+    if let Ok(meta) = tokio::fs::metadata(&temp_path).await {
+        if meta.is_file() && meta.len() <= file_size {
+            on_disk = meta.len();
+        }
+    }
+
+    let mut start_index = 0usize;
+    while start_index < chunks.len() && chunks[start_index].0 + chunks[start_index].1 <= on_disk {
+        start_index += 1;
+    }
+    let resume_at = if start_index < chunks.len() {
+        chunks[start_index].0
+    } else {
+        file_size
+    };
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&temp_path)
+        .await?;
+    if file.metadata().await?.len() != resume_at {
+        file.set_len(resume_at).await?;
+    }
+
+    if resume_at > 0 {
+        println!("  Reprise a {}", api::format_bytes(resume_at));
+    }
+
+    // --- Progress -----------------------------------------------------------
+    let pb = ProgressBar::new(file_size);
+    pb.set_style(progress_style());
+    pb.set_prefix(short_label(&file_name, 26));
+    pb.set_position(resume_at);
+
+    // --- Shared state -------------------------------------------------------
+    let output_file = Arc::new(Mutex::new(file));
+    let chunks = Arc::new(chunks);
+    let next_chunk = Arc::new(AtomicU64::new(start_index as u64));
+    let failed = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let throttle = Arc::new(Throttle::new(speed_limit));
+    let url = Arc::new(dl_url.to_string());
+    let aes_key = Arc::new(aes_key);
+    let aes_iv = Arc::new(aes_iv);
+
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let client = client.clone();
+        let chunks = chunks.clone();
+        let next_chunk = next_chunk.clone();
+        let failed = failed.clone();
+        let stop = stop.clone();
+        let output_file = output_file.clone();
+        let throttle = throttle.clone();
+        let url = url.clone();
+        let aes_key = aes_key.clone();
+        let aes_iv = aes_iv.clone();
+        let pb = pb.clone();
+
+        handles.push(tokio::spawn(async move {
+            loop {
+                if stop.load(Ordering::Relaxed) || failed.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let index = next_chunk.fetch_add(1, Ordering::SeqCst) as usize;
+                if index >= chunks.len() {
+                    break;
+                }
+
+                let (offset, size) = chunks[index];
+                let chunk_url = gen_chunk_url(url.as_str(), file_size, offset, size);
+
+                let encrypted = match fetch_chunk(&client, &chunk_url, size).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        pb.suspend(|| {
+                            eprintln!(
+                                "\n  Erreur chunk {}-{} : {}",
+                                offset,
+                                offset + size - 1,
+                                e
+                            )
+                        });
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                };
+
+                // Decrypt the chunk at its own position in the file stream.
+                let mut buffer = encrypted;
+                let iv = forward_mega_link_key_iv(aes_iv.as_slice(), offset);
+                let mut cipher = make_aes_ctr_cipher(aes_key.as_slice(), &iv);
+                cipher.apply_keystream(&mut buffer);
+
+                {
+                    let mut file = output_file.lock().await;
+                    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                        pb.suspend(|| eprintln!("\n  Erreur seek: {}", e));
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    if let Err(e) = file.write_all(&buffer).await {
+                        pb.suspend(|| eprintln!("\n  Erreur ecriture: {}", e));
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+
+                pb.inc(size);
+                throttle.consume(size).await;
+            }
+        }));
+    }
+
+    for handle in handles {
+        if let Err(e) = handle.await {
+            failed.store(true, Ordering::Relaxed);
+            eprintln!("  Tache interrompue: {}", e);
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    // Release the file handle (needed on Windows before renaming).
+    drop(output_file);
+
+    if failed.load(Ordering::Relaxed) {
+        pb.abandon_with_message("interrompu");
+        return Err(anyhow!(
+            "telechargement interrompu - relance pour reprendre ({})",
+            temp_path.display()
+        ));
+    }
+
+    let written = tokio::fs::metadata(&temp_path).await?.len();
+    if written != file_size {
+        pb.abandon_with_message("incomplet");
+        return Err(anyhow!(
+            "fichier incomplet: {} / {}",
+            api::format_bytes(written),
+            api::format_bytes(file_size)
+        ));
+    }
+
+    pb.finish_and_clear();
+
+    if dest_path.exists() {
+        tokio::fs::remove_file(dest_path).await?;
+    }
+    tokio::fs::rename(&temp_path, dest_path).await?;
+
+    Ok(true)
+}
+
+/// Fetch one chunk, retrying on transient errors.
+async fn fetch_chunk(client: &Client, url: &str, expected: u64) -> Result<Vec<u8>> {
+    let mut last_error = anyhow!("erreur inconnue");
+
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let backoff = 1u64 << (attempt.min(4) - 1);
+            tokio::time::sleep(Duration::from_secs(backoff.min(8))).await;
+        }
+
+        match try_fetch_chunk(client, url, expected).await {
+            Ok(data) => return Ok(data),
+            Err(e) => last_error = e,
+        }
+    }
+
+    Err(last_error)
+}
+
+async fn try_fetch_chunk(client: &Client, url: &str, expected: u64) -> Result<Vec<u8>> {
+    let response = client
         .get(url)
         .header("User-Agent", "Mozilla/5.0")
         .send()
         .await?;
 
-    let status = resp.status();
+    let status = response.status();
     if !status.is_success() {
-        return Err(anyhow!("HTTP {}", status));
+        return Err(anyhow!("HTTP {}", status.as_u16()));
     }
 
-    let bytes = resp.bytes().await?;
-    if bytes.len() as u64 != expected_size {
+    let bytes = response.bytes().await?;
+    if bytes.len() as u64 != expected {
         return Err(anyhow!(
-            "Taille incorrecte: attendu {} recu {}",
-            expected_size,
+            "taille incorrecte: attendu {}, recu {}",
+            expected,
             bytes.len()
         ));
     }
@@ -202,82 +485,192 @@ async fn download_chunk(client: &Client, url: &str, expected_size: u64) -> Resul
     Ok(bytes.to_vec())
 }
 
-/// Download all files from a public folder link
-pub async fn download_folder(
-    client: &Client,
-    link: &str,
-    dest_dir: &str,
-    _workers: usize,
-) -> Result<()> {
-    let (folder_id, folder_key) = api::extract_folder_id_and_key(link)?;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-    println!("  Chargement du contenu du dossier...");
-    let nodes = api::get_folder_nodes(client, &folder_id, &folder_key).await?;
+/// Split a MEGA file into its (offset, size) chunks.
+fn build_chunks(file_size: u64) -> Vec<(u64, u64)> {
+    let mut chunks = Vec::new();
+    let mut chunk_id = 1u64;
 
-    // Build path tree
-    let files: Vec<_> = nodes.iter().filter(|n| n.node_type == 0).collect();
-    let folders: Vec<_> = nodes.iter().filter(|n| n.node_type == 1 || n.node_type == 2).collect();
-
-    println!("  {} fichiers, {} dossiers trouves", files.len(), folders.len());
-
-    // Create folder structure
-    fn build_path(node: &api::FileNode, nodes: &[api::FileNode]) -> String {
-        let parent = nodes.iter().find(|n| n.handle == node.parent);
-        match parent {
-            Some(p) if p.node_type != 2 => format!("{}/{}", build_path(p, nodes), node.name),
-            _ => node.name.clone(),
+    loop {
+        let offset = calculate_chunk_offset(chunk_id, CHUNK_SIZE_MULTI);
+        if offset >= file_size {
+            break;
         }
+        let size = calculate_chunk_size(chunk_id, file_size, offset, CHUNK_SIZE_MULTI);
+        if size == 0 {
+            break;
+        }
+        chunks.push((offset, size));
+        chunk_id += 1;
     }
 
-    for folder in &folders {
-        if folder.node_type == 2 {
+    chunks
+}
+
+/// AES key + IV used to decrypt a file, from its base64 node key.
+fn derive_file_keys(file_key: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let raw = url_base64_decode(file_key)?;
+    if raw.len() >= 32 {
+        Ok((init_mega_link_key(file_key)?, init_mega_link_key_iv(file_key)?))
+    } else if raw.len() == 16 {
+        Ok((raw, vec![0u8; 16]))
+    } else {
+        Err(anyhow!("cle de fichier invalide"))
+    }
+}
+
+/// Build the relative path of every node of a folder listing.
+fn resolve_paths(nodes: &[api::FileNode], folder_id: &str) -> HashMap<String, PathBuf> {
+    let by_handle: HashMap<&str, &api::FileNode> =
+        nodes.iter().map(|node| (node.handle.as_str(), node)).collect();
+
+    // The shared folder is either listed under its own handle, flagged as a
+    // root (t=2), or is simply the node whose parent is not part of the listing.
+    let root = nodes
+        .iter()
+        .find(|node| node.handle == folder_id)
+        .or_else(|| nodes.iter().find(|node| node.node_type == 2))
+        .or_else(|| {
+            nodes
+                .iter()
+                .find(|node| !by_handle.contains_key(node.parent.as_str()))
+        })
+        .map(|node| node.handle.clone());
+
+    let mut paths = HashMap::new();
+
+    for node in nodes {
+        if Some(node.handle.as_str()) == root.as_deref() {
             continue;
         }
-        let path = Path::new(dest_dir).join(build_path(folder, &nodes));
-        tokio::fs::create_dir_all(&path).await?;
+
+        let mut parts: Vec<String> = Vec::new();
+        let mut current = node;
+        let mut guard = 0usize;
+
+        loop {
+            if Some(current.handle.as_str()) == root.as_deref() {
+                break;
+            }
+            parts.push(sanitize_file_name(&current.name));
+
+            if current.parent.is_empty() {
+                break;
+            }
+            let parent = match by_handle.get(current.parent.as_str()) {
+                Some(&parent) => parent,
+                None => break, // orphan node: keep the path built so far
+            };
+            if parent.handle == current.handle {
+                break; // corrupted listing, avoid an endless loop
+            }
+            current = parent;
+
+            guard += 1;
+            if guard > 512 {
+                parts.clear();
+                parts.push(sanitize_file_name(&node.name));
+                break;
+            }
+        }
+
+        parts.reverse();
+        if parts.is_empty() {
+            parts.push(sanitize_file_name(&node.name));
+        }
+
+        let path: PathBuf = parts.iter().map(|part| part.as_str()).collect();
+        paths.insert(node.handle.clone(), path);
     }
 
-    // Download each file
-    let _folder_key_bytes = url_base64_key_decode(&folder_key)?;
+    paths
+}
 
-    for file_node in &files {
-        let rel_path = build_path(file_node, &nodes);
-        let full_path = Path::new(dest_dir).join(&rel_path);
+/// Make a MEGA node name safe to use as a single path component.
+pub fn sanitize_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
 
-        // Create N-link for this file
-        // We need the file's decrypted key to build a proper download link
-        let _n_link = format!(
-            "https://mega.nz/#N!{}!{}###n={}",
-            file_node.handle,
-            url_base64_encode(&[0; 32]), // placeholder
-            folder_id
-        );
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "sans_nom".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
-        println!("\n  -> {}", rel_path);
+fn progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "  {prefix} {bar:32.cyan/blue} {percent:>3}% {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("=>-")
+}
 
-        // Get download URL using folder context
-        let request = format!(r#"[{{"a":"g","g":"1","n":"{}"}}]"#, file_node.handle);
-        let res = api::raw_api_request_with_node(client, &request, None, &folder_id).await?;
+fn short_label(name: &str, max: usize) -> String {
+    if name.chars().count() <= max {
+        return name.to_string();
+    }
+    let mut label: String = name.chars().take(max.saturating_sub(1)).collect();
+    label.push('~');
+    label
+}
 
-        if let Some(_dl_url) = res[0]["g"].as_str() {
-            // We need the proper key for this file - already decoded in the node name
-            // For folder files, the key was already decrypted during get_folder_nodes
-            // We need to re-extract it properly
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
 
-            // For now, download the raw encrypted data and we'll handle key separately
-            // This is a simplified version - full implementation would track keys per node
-            println!("    Taille: {}", api::format_bytes(file_node.size));
+fn format_speed(bytes_per_sec: f64) -> String {
+    api::format_bytes(bytes_per_sec as u64) + "/s"
+}
 
-            if file_node.size == 0 {
-                tokio::fs::write(&full_path, b"").await?;
-                continue;
-            }
+/// Global bandwidth limiter shared by all workers of one file.
+struct Throttle {
+    bytes_per_sec: f64,
+    started: Instant,
+    bytes: AtomicU64,
+}
 
-            // TODO: proper per-file key tracking for folder downloads
-            // For now just show that we found the files
-            println!("    [Telecharger les fichiers de dossiers necessite un lien direct par fichier]");
+impl Throttle {
+    fn new(kib_per_sec: u64) -> Self {
+        Self {
+            bytes_per_sec: kib_per_sec as f64 * 1024.0,
+            started: Instant::now(),
+            bytes: AtomicU64::new(0),
         }
     }
 
-    Ok(())
+    /// Sleep as needed so the average speed stays under the configured limit.
+    async fn consume(&self, bytes: u64) {
+        if self.bytes_per_sec <= 0.0 {
+            return;
+        }
+
+        let total = self.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let expected = total as f64 / self.bytes_per_sec;
+        let elapsed = self.started.elapsed().as_secs_f64();
+
+        if expected > elapsed {
+            let wait = expected - elapsed;
+            if wait > 0.001 {
+                tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+            }
+        }
+    }
 }

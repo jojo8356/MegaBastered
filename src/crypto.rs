@@ -169,6 +169,24 @@ pub fn init_mega_link_key_iv(key_string: &str) -> Result<Vec<u8>> {
     Ok(i32a_to_bin(&iv))
 }
 
+/// Derive the 16-byte AES key from a decrypted MEGA node key.
+///
+/// A node key is 32 bytes: the AES key is the first half XOR-ed with the second
+/// half. Legacy 16-byte node keys are used as-is.
+pub fn node_aes_key(dec_key: &[u8]) -> Vec<u8> {
+    if dec_key.len() >= 32 {
+        let words = bin_to_i32a(&dec_key[..32]);
+        i32a_to_bin(&[
+            words[0] ^ words[4],
+            words[1] ^ words[5],
+            words[2] ^ words[6],
+            words[3] ^ words[7],
+        ])
+    } else {
+        dec_key[..dec_key.len().min(16)].to_vec()
+    }
+}
+
 pub fn forward_mega_link_key_iv(iv: &[u8], forward_bytes: u64) -> Vec<u8> {
     let mut new_iv = vec![0u8; iv.len()];
     let half = iv.len() / 2;

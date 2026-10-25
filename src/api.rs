@@ -118,8 +118,63 @@ pub async fn raw_api_request_with_node(
         .await?;
 
     let text = resp.text().await?;
+    if text.trim().is_empty() {
+        return Err(anyhow!("Reponse vide de l'API MEGA"));
+    }
     let val: Value = serde_json::from_str(&text)?;
+    check_api_error(&val)?;
     Ok(val)
+}
+
+/// Turn a `-N` MEGA error payload into a readable error.
+fn check_api_error(val: &Value) -> Result<()> {
+    let code = match val.as_i64() {
+        Some(code) => Some(code),
+        None => val
+            .as_array()
+            .filter(|a| a.len() == 1)
+            .and_then(|a| a[0].as_i64()),
+    };
+
+    if let Some(code) = code {
+        if code < 0 && code != -1 && code != -3 {
+            return Err(anyhow!(
+                "MEGA API error {} ({})",
+                code,
+                mega_error_hint(code)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mega_error_hint(code: i64) -> &'static str {
+    match code {
+        -2 => "argument invalide",
+        -4 => "trop de requetes, reessayez dans un instant",
+        -8 => "lien expire",
+        -9 => "element introuvable ou supprime",
+        -11 => "acces refuse",
+        -16 => "compte bloque",
+        -17 => "quota de transfert depasse",
+        -18 => "service temporairement indisponible",
+        _ => "erreur inconnue",
+    }
+}
+
+/// Get a download URL for a node of a public folder.
+pub async fn get_node_download_url(
+    client: &Client,
+    folder_id: &str,
+    node_handle: &str,
+) -> Result<String> {
+    let request = format!(r#"[{{"a":"g","g":"1","n":"{}"}}]"#, node_handle);
+    let res = raw_api_request_with_node(client, &request, None, folder_id).await?;
+
+    res[0]["g"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("Pas d'URL de telechargement pour le noeud {}", node_handle))
 }
 
 // --- Check account version ---
@@ -438,23 +493,14 @@ pub async fn list_files(client: &Client, session: &MegaSession) -> Result<Vec<Fi
 
             // Try to decrypt attributes
             let mut name = h.clone();
+            let mut node_key = String::new();
             if let Some(k_str) = node["k"].as_str() {
                 if let Some(key_part) = k_str.split(':').nth(1) {
                     if let Ok(enc_key) = url_base64_decode(key_part) {
                         if let Ok(dec_key) = aes_ecb_decrypt(&enc_key, &master_key_bin) {
+                            node_key = url_base64_encode(&dec_key);
                             if let Some(at) = node["a"].as_str() {
-                                let file_key = if dec_key.len() >= 32 {
-                                    let ik = bin_to_i32a(&dec_key[..32]);
-                                    i32a_to_bin(&[
-                                        ik[0] ^ ik[4],
-                                        ik[1] ^ ik[5],
-                                        ik[2] ^ ik[6],
-                                        ik[3] ^ ik[7],
-                                    ])
-                                } else {
-                                    dec_key[..16.min(dec_key.len())].to_vec()
-                                };
-                                if let Ok(attrs) = decrypt_mega_attr(at, &file_key) {
+                                if let Ok(attrs) = decrypt_mega_attr(at, &node_aes_key(&dec_key)) {
                                     if let Some(n) = attrs["n"].as_str() {
                                         name = n.to_string();
                                     }
@@ -471,6 +517,7 @@ pub async fn list_files(client: &Client, session: &MegaSession) -> Result<Vec<Fi
                 node_type: t as i32,
                 size: s,
                 name,
+                key: node_key,
             });
         }
     }
@@ -499,18 +546,18 @@ pub async fn get_folder_nodes(
             let s = node["s"].as_u64().unwrap_or(0);
 
             let mut name = h.clone();
-            #[allow(unused_assignments)]
-            let mut node_key_str = String::new();
+            let mut node_key = String::new();
 
             if let Some(k_str) = node["k"].as_str() {
-                let parts: Vec<&str> = k_str.split(':').collect();
-                if parts.len() == 2 && !parts[1].is_empty() {
-                    if let Ok(enc_key) = url_base64_decode(parts[1]) {
+                // Node keys are sent as "<node handle>:<base64 key>" but some
+                // endpoints only send the key itself.
+                let encoded = k_str.rsplit(':').next().unwrap_or(k_str);
+                if !encoded.is_empty() {
+                    if let Ok(enc_key) = url_base64_decode(encoded) {
                         if let Ok(dec_key) = aes_ecb_decrypt(&enc_key, &folder_key_bytes) {
-                            node_key_str = url_base64_encode(&dec_key);
-                            let file_key = url_base64_key_decode(&node_key_str).unwrap_or(dec_key);
+                            node_key = url_base64_encode(&dec_key);
                             if let Some(at) = node["a"].as_str() {
-                                if let Ok(attrs) = decrypt_mega_attr(at, &file_key) {
+                                if let Ok(attrs) = decrypt_mega_attr(at, &node_aes_key(&dec_key)) {
                                     if let Some(n) = attrs["n"].as_str() {
                                         name = n.to_string();
                                     }
@@ -527,6 +574,7 @@ pub async fn get_folder_nodes(
                 node_type: t as i32,
                 size: s,
                 name,
+                key: node_key,
             });
         }
     }
@@ -543,6 +591,20 @@ pub struct FileNode {
     pub node_type: i32, // 0=file, 1=folder, 2=root, 3=inbox, 4=trash
     pub size: u64,
     pub name: String,
+    /// URL-safe base64 of the decrypted node key (32 bytes, or 16 bytes for
+    /// legacy nodes). This is the `handle:key` part of a MEGA file link and is
+    /// what the download engine needs to decrypt the file.
+    pub key: String,
+}
+
+impl FileNode {
+    pub fn is_file(&self) -> bool {
+        self.node_type == 0
+    }
+
+    pub fn is_folder(&self) -> bool {
+        self.node_type == 1
+    }
 }
 
 // --- Link parsing helpers ---
