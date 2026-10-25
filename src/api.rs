@@ -371,6 +371,34 @@ pub async fn get_file_metadata(client: &Client, link: &str, sid: Option<&str>) -
     Ok((fname, fsize, file_key))
 }
 
+// --- Free transfer quota left for this IP address ---
+
+/// Ask MEGA how much transfer quota is left for this IP address (`a:"uq"`).
+///
+/// Works without an account: this is the quota MEGA applies to the IP that
+/// asks, which is exactly the one that triggers HTTP 509.
+pub async fn get_free_quota(client: &Client, sid: Option<&str>) -> Result<(u64, u64)> {
+    let request = r#"[{"a":"uq","xfer":1,"strg":1}]"#;
+    let res = raw_api_request(client, request, sid).await?;
+    let object = res.get(0).cloned().unwrap_or(Value::Null);
+
+    let used = object["cstrgn"]
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(|value| value.as_u64())
+        .or_else(|| object["cstrg"].as_u64())
+        .unwrap_or(0);
+
+    let total = object["mstrgn"]
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(|value| value.as_u64())
+        .or_else(|| object["mstrg"].as_u64())
+        .unwrap_or(0);
+
+    Ok((used, total))
+}
+
 // --- Get quota ---
 
 pub async fn get_quota(client: &Client, session: &MegaSession) -> Result<(u64, u64)> {

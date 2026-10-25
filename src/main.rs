@@ -104,6 +104,20 @@ async fn menu_download_link(state: &mut AppState) {
     let mut config = state.download_config();
     config.workers = workers;
 
+    match api::get_free_quota(&state.client, state.session.as_ref().and_then(|s| s.sid.as_deref())).await {
+        Ok((used, total)) => println!(
+            "  Quota MEGA (cette IP): {} utilises{}",
+            api::format_bytes(used),
+            if total == 0 {
+                String::new()
+            } else {
+                format!(" sur {}", api::format_bytes(total))
+            }
+        ),
+        Err(_) => {}
+    }
+    println!();
+
     let result = if folder {
         download::download_folder(&state.client, &link, &path, config)
             .await
@@ -547,6 +561,10 @@ struct CliArgs {
     speed_limit: u64,
     quota_wait: std::time::Duration,
     list: bool,
+    /// Print the remaining transfer quota for this IP and exit.
+    quota_only: bool,
+    /// Optional HTTP/SOCKS5 proxy for every MEGA request (e.g. a VPN endpoint).
+    proxy: Option<String>,
 }
 
 fn print_cli_help() {
@@ -563,6 +581,9 @@ Options:\n  \
   -q, --quota-wait <min>  en cas de quota MEGA (HTTP 509), attendre N minutes\n                          \
 puis reprendre au lieu de s'arreter (defaut: 0)\n  \
   -l, --list              lister le contenu du dossier\n  \
+      --quota             afficher le quota de transfert restant pour cette IP\n  \
+      --proxy <url>       proxy HTTP/SOCKS5 pour toutes les requetes\n  \
+                          (ex: socks5h://127.0.0.1:9050)\n  \
   -h, --help              cette aide\n\n\
 Codes de sortie: 0 succes, 1 erreur, 2 quota MEGA atteint (relancer plus tard).",
         env!("CARGO_PKG_VERSION")
@@ -582,6 +603,8 @@ fn parse_cli() -> Option<CliArgs> {
     let mut speed_limit = 0u64;
     let mut quota_wait_min = 0u64;
     let mut list = false;
+    let mut proxy: Option<String> = None;
+    let mut quota_only = false;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -592,6 +615,11 @@ fn parse_cli() -> Option<CliArgs> {
                 std::process::exit(0);
             }
             "-l" | "--list" => list = true,
+            "--quota" => quota_only = true,
+            "--proxy" => {
+                index += 1;
+                proxy = args.get(index).cloned();
+            }
             "-d" | "--dest" => {
                 index += 1;
                 dest = args.get(index).cloned();
@@ -643,6 +671,8 @@ fn parse_cli() -> Option<CliArgs> {
         speed_limit,
         quota_wait: std::time::Duration::from_secs(quota_wait_min * 60),
         list,
+        quota_only,
+        proxy,
     })
 }
 
@@ -652,15 +682,53 @@ fn default_download_dir() -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
+fn build_client(proxy: Option<&str>) -> Result<Client> {
+    let mut builder = Client::builder().timeout(std::time::Duration::from_secs(120));
+
+    if let Some(url) = proxy {
+        let proxy = reqwest::Proxy::all(url)
+            .map_err(|e| anyhow::anyhow!("proxy invalide ({}): {}", url, e))?;
+        builder = builder.proxy(proxy);
+        println!("Proxy: {}", url);
+    }
+
+    Ok(builder.build()?)
+}
+
+/// Print what MEGA still allows for this IP address.
+async fn print_quota(client: &Client) -> Result<()> {
+    match api::get_free_quota(client, None).await {
+        Ok((used, total)) => {
+            println!(
+                "  Quota de transfert pour cette IP: {} utilises sur {}",
+                api::format_bytes(used),
+                if total == 0 {
+                    "inconnu (MEGA ne publie pas la limite)".to_string()
+                } else {
+                    api::format_bytes(total)
+                }
+            );
+            if total > 0 && used >= total {
+                println!("  Quota epuise: attends 1 a 6 h, ou lance avec -q 60 pour attendre.");
+            }
+        }
+        Err(e) => println!("  Quota indisponible: {}", e),
+    }
+    Ok(())
+}
+
 async fn run_cli(args: CliArgs) -> Result<()> {
     if !api::is_mega_link(&args.link) {
         eprintln!("Lien MEGA invalide: {}", args.link);
         std::process::exit(1);
     }
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
+    let client = build_client(args.proxy.as_deref())?;
+
+    if args.quota_only {
+        print_quota(&client).await?;
+        return Ok(());
+    }
 
     if args.list {
         let entries = download::list_folder(&client, &args.link).await?;
@@ -738,6 +806,8 @@ async fn run_cli(args: CliArgs) -> Result<()> {
         speed_limit: args.speed_limit,
         quota_wait: args.quota_wait,
     };
+
+    print_quota(&client).await?;
 
     if api::is_folder_link(&args.link) {
         println!("Dossier: {}", args.link);
