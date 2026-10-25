@@ -13,7 +13,8 @@ No Java, no Electron, no bloat. Just a single binary that handles downloads, upl
 - **Cloud file browser** - List files in tree view with handles for easy reference
 - **Folder downloads** - Download a whole public folder (or sub-folder): tree is recreated, every file is decrypted with its own node key, already downloaded files are skipped
 - **Resumable transfers** - Per-chunk index (`.megacli.parts`): an interrupted download resumes exactly where it stopped, and a partial file is never reported as complete
-- **Quota aware** - HTTP 509 (MEGA transfer quota) stops the run cleanly and can wait/resume on its own (`--quota-wait`)
+- **Quota aware** - asks MEGA how much transfer quota is left for your IP (`--quota`), stops cleanly on HTTP 509 and can wait/resume on its own (`--quota-wait`)
+- **Proxy support** - route every MEGA request through your own HTTP/SOCKS5 proxy or VPN endpoint (`--proxy`)
 - **Scriptable CLI** - `megacli <link>` to download, `megacli --list <link> [-d dest]` to see what is already done
 - **Instant re-runs** - a concurrent pre-scan of the destination lists what is already complete, those files are never touched again and their leftovers are cleaned
 - **Quota monitoring** - Check storage usage and remaining space
@@ -48,7 +49,7 @@ Binary output: `target/release/megacli`
 ```
 $ ./megacli
 
-MegaCLI v0.1.3
+MegaCLI v0.1.4
 Client MEGA en Rust - Download/Upload/Stream
 
 > Action
@@ -79,6 +80,12 @@ megacli "https://mega.nz/folder/<id>#<key>" -d ~/Documents/Formations -w 8
 
 # Same, but wait 30 min and continue automatically when MEGA's quota hits
 megacli "https://mega.nz/folder/<id>#<key>" -d ~/Documents/Formations -q 30
+
+# How much transfer quota is left for the current IP?
+megacli --quota
+
+# Route everything through a proxy / VPN endpoint
+megacli "<lien>" -d ~/Formations --proxy socks5h://127.0.0.1:9050
 ```
 
 Exit codes: `0` success, `1` error, `2` MEGA quota reached (safe to relaunch later).
@@ -103,8 +110,17 @@ What this client does about it:
   automatically instead of stopping;
 - a paid MEGA plan raises the limit (its quota is per account, not per IP).
 
-The client does not rotate proxies/VPNs to farm free quota: that is against
-MEGA's terms of service.
+What is left is done by MEGA, not by the client: waiting for the rolling window
+(the honest "bypass"), using a paid plan, or routing your own traffic through
+your own VPN/proxy with `--proxy`. The client does **not** rotate proxies/VPNs
+automatically to farm free quota: that is against MEGA's terms of service.
+
+Two practical details that save quota:
+
+- chunk indexes are flushed before being recorded, and a file that looks
+  complete but is short is re-downloaded once automatically, so a run never
+  burns quota on a file it then calls "incomplete";
+- files already on disk with the right size are never requested again.
 
 ### Download a public link
 
