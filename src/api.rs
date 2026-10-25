@@ -492,24 +492,11 @@ pub async fn list_files(client: &Client, session: &MegaSession) -> Result<Vec<Fi
             let s = node["s"].as_u64().unwrap_or(0);
 
             // Try to decrypt attributes
-            let mut name = h.clone();
-            let mut node_key = String::new();
-            if let Some(k_str) = node["k"].as_str() {
-                if let Some(key_part) = k_str.split(':').nth(1) {
-                    if let Ok(enc_key) = url_base64_decode(key_part) {
-                        if let Ok(dec_key) = aes_ecb_decrypt(&enc_key, &master_key_bin) {
-                            node_key = url_base64_encode(&dec_key);
-                            if let Some(at) = node["a"].as_str() {
-                                if let Ok(attrs) = decrypt_mega_attr(at, &node_aes_key(&dec_key)) {
-                                    if let Some(n) = attrs["n"].as_str() {
-                                        name = n.to_string();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let (name, node_key) = match decrypt_node_key(node, &master_key_bin) {
+                Some((key, Some(name))) => (name, key),
+                Some((key, None)) => (h.clone(), key),
+                None => (h.clone(), String::new()),
+            };
 
             nodes.push(FileNode {
                 handle: h,
@@ -523,6 +510,51 @@ pub async fn list_files(client: &Client, session: &MegaSession) -> Result<Vec<Fi
     }
 
     Ok(nodes)
+}
+
+/// Decrypt a node key coming from a listing entry.
+///
+/// MEGA sends `<handle>:<base64 key>` and, for imported/shared nodes, several
+/// keys separated by `/` (one per sharing chain). Every segment is tried until
+/// one of them decrypts the node attributes.
+///
+/// Returns the full node key (base64 of the 32 raw bytes, as used in file
+/// links) and the decrypted name when available.
+fn decrypt_node_key(node: &Value, wrapping_key: &[u8]) -> Option<(String, Option<String>)> {
+    let k_str = node["k"].as_str()?;
+    let attr = node["a"].as_str();
+    let mut fallback: Option<String> = None;
+
+    for segment in k_str.split('/') {
+        let encoded = segment.rsplit(':').next().unwrap_or(segment);
+        if encoded.is_empty() {
+            continue;
+        }
+
+        let enc_key = match url_base64_decode(encoded) {
+            Ok(key) => key,
+            Err(_) => continue,
+        };
+        let dec_key = match aes_ecb_decrypt(&enc_key, wrapping_key) {
+            Ok(key) => key,
+            Err(_) => continue,
+        };
+        let key_b64 = url_base64_encode(&dec_key);
+
+        if let Some(attr) = attr {
+            if let Ok(attrs) = decrypt_mega_attr(attr, &node_aes_key(&dec_key)) {
+                if let Some(name) = attrs["n"].as_str() {
+                    return Some((key_b64, Some(name.to_string())));
+                }
+            }
+        }
+
+        if fallback.is_none() {
+            fallback = Some(key_b64);
+        }
+    }
+
+    fallback.map(|key| (key, None))
 }
 
 // --- Get folder nodes (public folder link) ---
@@ -545,28 +577,11 @@ pub async fn get_folder_nodes(
             let t = node["t"].as_i64().unwrap_or(-1);
             let s = node["s"].as_u64().unwrap_or(0);
 
-            let mut name = h.clone();
-            let mut node_key = String::new();
-
-            if let Some(k_str) = node["k"].as_str() {
-                // Node keys are sent as "<node handle>:<base64 key>" but some
-                // endpoints only send the key itself.
-                let encoded = k_str.rsplit(':').next().unwrap_or(k_str);
-                if !encoded.is_empty() {
-                    if let Ok(enc_key) = url_base64_decode(encoded) {
-                        if let Ok(dec_key) = aes_ecb_decrypt(&enc_key, &folder_key_bytes) {
-                            node_key = url_base64_encode(&dec_key);
-                            if let Some(at) = node["a"].as_str() {
-                                if let Ok(attrs) = decrypt_mega_attr(at, &node_aes_key(&dec_key)) {
-                                    if let Some(n) = attrs["n"].as_str() {
-                                        name = n.to_string();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let (name, node_key) = match decrypt_node_key(node, &folder_key_bytes) {
+                Some((key, Some(name))) => (name, key),
+                Some((key, None)) => (h.clone(), key),
+                None => (h.clone(), String::new()),
+            };
 
             nodes.push(FileNode {
                 handle: h,

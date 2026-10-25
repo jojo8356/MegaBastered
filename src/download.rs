@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::api;
 use crate::crypto::*;
@@ -18,8 +18,10 @@ use crate::crypto::*;
 const CHUNK_SIZE_MULTI: u64 = 20;
 const MAX_WORKERS: usize = 20;
 const MAX_RETRIES: u32 = 8;
-/// Suffix of the in-progress file. Kept as `.tmp` so it is git/tooling friendly
-/// and easy to spot when cleaning up.
+/// MEGA download URLs are valid for a few minutes only; renew them a bounded
+/// number of times per file.
+const MAX_URL_REFRESH: u64 = 20;
+/// Suffix of the in-progress file.
 const TEMP_SUFFIX: &str = ".megacli.tmp";
 
 // ---------------------------------------------------------------------------
@@ -40,15 +42,16 @@ pub async fn download_from_link(
 
     let link = api::normalize_mega_link(link);
     let (filename, file_size, file_key) = api::get_file_metadata(client, &link, None).await?;
-    let dl_url = api::get_file_download_url(client, &link, None).await?;
 
     println!("  Fichier: {}", filename);
     println!("  Taille:  {}", api::format_bytes(file_size));
 
     let dest = Path::new(dest_dir).join(sanitize_file_name(&filename));
+    let source = UrlSource::Link(link);
+
     if download_file(
         client,
-        &dl_url,
+        &source,
         file_size,
         &file_key,
         &dest,
@@ -80,7 +83,7 @@ pub async fn download_folder(
 
     if nodes.is_empty() {
         return Err(anyhow!(
-            "Dossier vide ou inaccessible - verifie que le lien est toujours valide"
+            "dossier vide ou inaccessible - verifie que le lien est toujours valide"
         ));
     }
 
@@ -90,10 +93,9 @@ pub async fn download_folder(
 
     // Recreate every folder, including the empty ones.
     let mut directories = 0usize;
-    for node in nodes.iter().filter(|n| n.is_folder()) {
-        if let Some(rel) = paths.get(&node.handle) {
-            let dir = base.join(rel);
-            if tokio::fs::create_dir_all(&dir).await.is_ok() {
+    for node in nodes.iter().filter(|node| node.is_folder()) {
+        if let Some(relative) = paths.get(&node.handle) {
+            if tokio::fs::create_dir_all(base.join(relative)).await.is_ok() {
                 directories += 1;
             }
         }
@@ -102,13 +104,13 @@ pub async fn download_folder(
     // Files, with their destination path.
     let files: Vec<(&api::FileNode, PathBuf)> = nodes
         .iter()
-        .filter(|n| n.is_file())
-        .map(|n| {
-            let rel = match paths.get(&n.handle) {
+        .filter(|node| node.is_file())
+        .map(|node| {
+            let relative = match paths.get(&node.handle) {
                 Some(path) => path.clone(),
-                None => PathBuf::from(sanitize_file_name(&n.name)),
+                None => PathBuf::from(sanitize_file_name(&node.name)),
             };
-            (n, rel)
+            (node, relative)
         })
         .collect();
 
@@ -122,7 +124,7 @@ pub async fn download_folder(
     println!("  Destination: {}", base.display());
 
     if files.is_empty() {
-        println!("\n  Aucun fichier a telecharger (dossiers vides crees).");
+        println!("\n  Aucun fichier a telecharger (dossiers vides recrees).");
         return Ok(());
     }
 
@@ -133,48 +135,30 @@ pub async fn download_folder(
     let mut done_bytes = 0u64;
     let mut failures: Vec<(String, String)> = Vec::new();
 
-    for (index, (node, rel)) in files.iter().enumerate() {
-        let dest = base.join(rel);
+    for (index, (node, relative)) in files.iter().enumerate() {
+        let dest = base.join(relative);
         println!(
             "\n  [{}/{}] {} ({})",
             index + 1,
             files.len(),
-            rel.display(),
+            relative.display(),
             api::format_bytes(node.size)
         );
 
         if node.key.is_empty() {
             println!("  Echec: cle de dechiffrement indisponible");
-            failures.push((rel.display().to_string(), "cle indisponible".to_string()));
+            failures.push((relative.display().to_string(), "cle indisponible".to_string()));
             continue;
         }
 
-        // Get a fresh download URL for this node. MEGA URLs are short lived so
-        // they are requested right before the transfer.
-        let mut dl_url = String::new();
-        let mut last_error = String::new();
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(attempt as u64 * 2)).await;
-            }
-            match api::get_node_download_url(client, &folder_id, &node.handle).await {
-                Ok(url) => {
-                    dl_url = url;
-                    last_error.clear();
-                    break;
-                }
-                Err(e) => last_error = e.to_string(),
-            }
-        }
-        if dl_url.is_empty() {
-            println!("  Echec: {}", last_error);
-            failures.push((rel.display().to_string(), last_error));
-            continue;
-        }
+        let source = UrlSource::FolderNode {
+            folder_id: folder_id.clone(),
+            handle: node.handle.clone(),
+        };
 
         match download_file(
             client,
-            &dl_url,
+            &source,
             node.size,
             &node.key,
             &dest,
@@ -194,29 +178,27 @@ pub async fn download_folder(
             }
             Err(e) => {
                 println!("  Echec: {}", e);
-                failures.push((rel.display().to_string(), e.to_string()));
+                failures.push((relative.display().to_string(), e.to_string()));
             }
         }
     }
 
-    // --- Recap ---
-    let elapsed = started.elapsed().as_secs_f64().max(0.001);
-    let average_speed = done_bytes as f64 / elapsed;
+    // --- Recap --------------------------------------------------------------
+    let elapsed = started.elapsed();
 
     println!("\n  ------------------------------------------------");
     println!(
         "  Termine en {} - {} telecharge(s), {} deja present(s), {} en echec",
-        format_duration(started.elapsed()),
+        format_duration(elapsed),
         downloaded,
         skipped,
         failures.len()
     );
     if done_bytes > 0 {
         println!(
-            "  {} telecharges a {} ({} moyen)",
+            "  {} transferes ({})",
             api::format_bytes(done_bytes),
-            format_speed(average_speed),
-            format_duration(started.elapsed())
+            format_speed(done_bytes as f64 / elapsed.as_secs_f64().max(0.001))
         );
     }
     if skipped_bytes > 0 {
@@ -242,14 +224,35 @@ pub async fn download_folder(
 // Download engine
 // ---------------------------------------------------------------------------
 
+/// Where the (short lived) download URL of a file comes from.
+#[derive(Clone)]
+enum UrlSource {
+    /// A public file link (`#!` / `#N!` style).
+    Link(String),
+    /// A node of a public folder.
+    FolderNode { folder_id: String, handle: String },
+}
+
+impl UrlSource {
+    async fn fetch(&self, client: &Client) -> Result<String> {
+        match self {
+            UrlSource::Link(link) => api::get_file_download_url(client, link, None).await,
+            UrlSource::FolderNode { folder_id, handle } => {
+                api::get_node_download_url(client, folder_id, handle).await
+            }
+        }
+    }
+}
+
 /// Download one file into `dest_path`.
 ///
 /// Returns `Ok(true)` when the file was downloaded, `Ok(false)` when it was
 /// already complete on disk. Interrupted downloads are kept in a `.megacli.tmp`
-/// file and resumed on the next run (only the incomplete part is fetched again).
+/// file and resumed on the next run (only the missing part is fetched again).
+#[allow(clippy::too_many_arguments)]
 async fn download_file(
     client: &Client,
-    dl_url: &str,
+    source: &UrlSource,
     file_size: u64,
     file_key: &str,
     dest_path: &Path,
@@ -284,7 +287,7 @@ async fn download_file(
 
     // --- Resume support -----------------------------------------------------
     // The temp file is only ever written at real chunk offsets, so its length
-    // tells us how many bytes were fully written. A partially written chunk is
+    // tells how many bytes were fully written. A half written chunk is simply
     // re-downloaded from its start.
     let mut on_disk = 0u64;
     if let Ok(meta) = tokio::fs::metadata(&temp_path).await {
@@ -327,29 +330,34 @@ async fn download_file(
     let chunks = Arc::new(chunks);
     let next_chunk = Arc::new(AtomicU64::new(start_index as u64));
     let failed = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
     let throttle = Arc::new(Throttle::new(speed_limit));
-    let url = Arc::new(dl_url.to_string());
     let aes_key = Arc::new(aes_key);
     let aes_iv = Arc::new(aes_iv);
+
+    // Download URLs expire, so the current one is shared and renew on demand.
+    let dl_url = Arc::new(RwLock::new(source.fetch(client).await?));
+    let url_generation = Arc::new(AtomicU64::new(0));
+    let url_refreshes = Arc::new(AtomicU64::new(0));
 
     let mut handles = Vec::new();
     for _ in 0..workers {
         let client = client.clone();
+        let source = source.clone();
         let chunks = chunks.clone();
         let next_chunk = next_chunk.clone();
         let failed = failed.clone();
-        let stop = stop.clone();
         let output_file = output_file.clone();
         let throttle = throttle.clone();
-        let url = url.clone();
         let aes_key = aes_key.clone();
         let aes_iv = aes_iv.clone();
+        let dl_url = dl_url.clone();
+        let url_generation = url_generation.clone();
+        let url_refreshes = url_refreshes.clone();
         let pb = pb.clone();
 
         handles.push(tokio::spawn(async move {
             loop {
-                if stop.load(Ordering::Relaxed) || failed.load(Ordering::Relaxed) {
+                if failed.load(Ordering::Relaxed) {
                     break;
                 }
 
@@ -359,19 +367,42 @@ async fn download_file(
                 }
 
                 let (offset, size) = chunks[index];
-                let chunk_url = gen_chunk_url(url.as_str(), file_size, offset, size);
+                let current_url = dl_url.read().await.clone();
+                let chunk_url = gen_chunk_url(&current_url, file_size, offset, size);
 
                 let encrypted = match fetch_chunk(&client, &chunk_url, size).await {
                     Ok(data) => data,
+                    Err(ChunkError::Expired) => {
+                        // Renew the download URL and retry this chunk once.
+                        match refresh_url(
+                            &client,
+                            &source,
+                            &dl_url,
+                            &url_generation,
+                            &url_refreshes,
+                        )
+                        .await
+                        {
+                            Ok(fresh_url) => {
+                                let retry_url = gen_chunk_url(&fresh_url, file_size, offset, size);
+                                match fetch_chunk(&client, &retry_url, size).await {
+                                    Ok(data) => data,
+                                    Err(e) => {
+                                        report_error(&pb, offset, size, &e.to_string());
+                                        failed.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                report_error(&pb, offset, size, &e.to_string());
+                                failed.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
                     Err(e) => {
-                        pb.suspend(|| {
-                            eprintln!(
-                                "\n  Erreur chunk {}-{} : {}",
-                                offset,
-                                offset + size - 1,
-                                e
-                            )
-                        });
+                        report_error(&pb, offset, size, &e.to_string());
                         failed.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -386,12 +417,12 @@ async fn download_file(
                 {
                     let mut file = output_file.lock().await;
                     if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
-                        pb.suspend(|| eprintln!("\n  Erreur seek: {}", e));
+                        report_error(&pb, offset, size, &format!("seek: {}", e));
                         failed.store(true, Ordering::Relaxed);
                         break;
                     }
                     if let Err(e) = file.write_all(&buffer).await {
-                        pb.suspend(|| eprintln!("\n  Erreur ecriture: {}", e));
+                        report_error(&pb, offset, size, &format!("ecriture: {}", e));
                         failed.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -406,10 +437,9 @@ async fn download_file(
     for handle in handles {
         if let Err(e) = handle.await {
             failed.store(true, Ordering::Relaxed);
-            eprintln!("  Tache interrompue: {}", e);
+            pb.suspend(|| eprintln!("\n  Tache interrompue: {}", e));
         }
     }
-    stop.store(true, Ordering::Relaxed);
 
     // Release the file handle (needed on Windows before renaming).
     drop(output_file);
@@ -442,9 +472,76 @@ async fn download_file(
     Ok(true)
 }
 
-/// Fetch one chunk, retrying on transient errors.
-async fn fetch_chunk(client: &Client, url: &str, expected: u64) -> Result<Vec<u8>> {
-    let mut last_error = anyhow!("erreur inconnue");
+fn report_error(pb: &ProgressBar, offset: u64, size: u64, message: &str) {
+    pb.suspend(|| {
+        eprintln!(
+            "\n  Erreur chunk {}-{} : {}",
+            offset,
+            offset + size.saturating_sub(1),
+            message
+        )
+    });
+}
+
+/// Get a new download URL, making sure only one worker renews it at a time.
+async fn refresh_url(
+    client: &Client,
+    source: &UrlSource,
+    dl_url: &Arc<RwLock<String>>,
+    generation: &Arc<AtomicU64>,
+    refreshes: &Arc<AtomicU64>,
+) -> Result<String, ChunkError> {
+    let seen = generation.load(Ordering::SeqCst);
+    let mut guard = dl_url.write().await;
+
+    // Somebody else already renewed it while we were waiting for the lock.
+    if generation.load(Ordering::SeqCst) != seen {
+        return Ok(guard.clone());
+    }
+
+    if refreshes.fetch_add(1, Ordering::SeqCst) >= MAX_URL_REFRESH {
+        return Err(ChunkError::Fatal(
+            "lien de telechargement expire (trop de renouvellements)".to_string(),
+        ));
+    }
+
+    match source.fetch(client).await {
+        Ok(url) => {
+            *guard = url.clone();
+            generation.fetch_add(1, Ordering::SeqCst);
+            Ok(url)
+        }
+        Err(e) => Err(ChunkError::Transient(format!(
+            "renouvellement du lien impossible: {}",
+            e
+        ))),
+    }
+}
+
+/// Why a chunk download failed.
+enum ChunkError {
+    /// HTTP 403: the download URL has expired.
+    Expired,
+    /// Retrying will not help (quota, missing node, ...).
+    Fatal(String),
+    /// Worth another try (network hiccup, 5xx, truncated body).
+    Transient(String),
+}
+
+impl std::fmt::Display for ChunkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChunkError::Expired => write!(f, "lien expire (HTTP 403)"),
+            ChunkError::Fatal(message) | ChunkError::Transient(message) => {
+                write!(f, "{}", message)
+            }
+        }
+    }
+}
+
+/// Fetch one chunk, retrying transient errors only.
+async fn fetch_chunk(client: &Client, url: &str, expected: u64) -> Result<Vec<u8>, ChunkError> {
+    let mut last_error = String::from("erreur inconnue");
 
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
@@ -454,32 +551,57 @@ async fn fetch_chunk(client: &Client, url: &str, expected: u64) -> Result<Vec<u8
 
         match try_fetch_chunk(client, url, expected).await {
             Ok(data) => return Ok(data),
-            Err(e) => last_error = e,
+            Err(ChunkError::Transient(message)) => last_error = message,
+            Err(other) => return Err(other),
         }
     }
 
-    Err(last_error)
+    Err(ChunkError::Transient(last_error))
 }
 
-async fn try_fetch_chunk(client: &Client, url: &str, expected: u64) -> Result<Vec<u8>> {
+async fn try_fetch_chunk(
+    client: &Client,
+    url: &str,
+    expected: u64,
+) -> Result<Vec<u8>, ChunkError> {
     let response = client
         .get(url)
         .header("User-Agent", "Mozilla/5.0")
         .send()
-        .await?;
+        .await
+        .map_err(|e| ChunkError::Transient(format!("reseau: {}", e)))?;
 
     let status = response.status();
+
+    if status.as_u16() == 403 {
+        return Err(ChunkError::Expired);
+    }
+    if status.as_u16() == 509 {
+        return Err(ChunkError::Fatal(
+            "quota de transfert MEGA atteint (HTTP 509)".to_string(),
+        ));
+    }
     if !status.is_success() {
-        return Err(anyhow!("HTTP {}", status.as_u16()));
+        let message = format!("HTTP {}", status.as_u16());
+        let transient = status.is_server_error() || status.as_u16() == 429;
+        return Err(if transient {
+            ChunkError::Transient(message)
+        } else {
+            ChunkError::Fatal(message)
+        });
     }
 
-    let bytes = response.bytes().await?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| ChunkError::Transient(format!("lecture: {}", e)))?;
+
     if bytes.len() as u64 != expected {
-        return Err(anyhow!(
+        return Err(ChunkError::Transient(format!(
             "taille incorrecte: attendu {}, recu {}",
             expected,
             bytes.len()
-        ));
+        )));
     }
 
     Ok(bytes.to_vec())
@@ -527,23 +649,13 @@ fn resolve_paths(nodes: &[api::FileNode], folder_id: &str) -> HashMap<String, Pa
     let by_handle: HashMap<&str, &api::FileNode> =
         nodes.iter().map(|node| (node.handle.as_str(), node)).collect();
 
-    // The shared folder is either listed under its own handle, flagged as a
-    // root (t=2), or is simply the node whose parent is not part of the listing.
-    let root = nodes
-        .iter()
-        .find(|node| node.handle == folder_id)
-        .or_else(|| nodes.iter().find(|node| node.node_type == 2))
-        .or_else(|| {
-            nodes
-                .iter()
-                .find(|node| !by_handle.contains_key(node.parent.as_str()))
-        })
-        .map(|node| node.handle.clone());
-
+    // The shared folder itself is the root: it is either listed under its own
+    // handle (usually without a key) or absent from the listing. Its name is
+    // never part of a download path.
     let mut paths = HashMap::new();
 
     for node in nodes {
-        if Some(node.handle.as_str()) == root.as_deref() {
+        if node.handle == folder_id || node.node_type == 2 {
             continue;
         }
 
@@ -552,25 +664,24 @@ fn resolve_paths(nodes: &[api::FileNode], folder_id: &str) -> HashMap<String, Pa
         let mut guard = 0usize;
 
         loop {
-            if Some(current.handle.as_str()) == root.as_deref() {
-                break;
-            }
             parts.push(sanitize_file_name(&current.name));
 
-            if current.parent.is_empty() {
+            if current.parent.is_empty() || current.parent == folder_id {
                 break;
             }
+
             let parent = match by_handle.get(current.parent.as_str()) {
                 Some(&parent) => parent,
-                None => break, // orphan node: keep the path built so far
+                None => break, // top level node: its parent is not in the listing
             };
-            if parent.handle == current.handle {
-                break; // corrupted listing, avoid an endless loop
+            if parent.handle == current.handle || parent.handle == folder_id {
+                break;
             }
             current = parent;
 
             guard += 1;
             if guard > 512 {
+                // Corrupted listing: fall back to the node name only.
                 parts.clear();
                 parts.push(sanitize_file_name(&node.name));
                 break;
@@ -637,7 +748,7 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn format_speed(bytes_per_sec: f64) -> String {
-    api::format_bytes(bytes_per_sec as u64) + "/s"
+    format!("{}/s", api::format_bytes(bytes_per_sec as u64))
 }
 
 /// Global bandwidth limiter shared by all workers of one file.
