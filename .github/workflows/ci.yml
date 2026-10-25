@@ -33,7 +33,17 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Check
-        run: cargo check --all-targets
+        shell: bash
+        run: |
+          set +e
+          cargo check --all-targets --message-format=short > check.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            sed -e 's/\x1b\[[0-9;]*m//g' check.log \
+              | grep -E "(error|warning)(\[|:)" | head -40 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+            exit $status
+          fi
 
       - name: Test
         shell: bash
