@@ -53,8 +53,17 @@ jobs:
           grep -E "^test result" test-output.log
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          cargo clippy --all-targets -- -D warnings > clippy.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            grep -E "^(error|warning)" clippy.log | head -40 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+            tail -40 clippy.log
+            exit $status
+          fi
 
       - name: Build release
         run: cargo build --release
