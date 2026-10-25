@@ -480,6 +480,7 @@ pub async fn get_quota_info(client: &Client, sid: Option<&str>) -> Result<QuotaI
 
 // --- Get quota ---
 
+#[allow(dead_code)]
 pub async fn get_quota(client: &Client, session: &MegaSession) -> Result<(u64, u64)> {
     let info = get_quota_info(client, session.sid.as_deref()).await?;
     Ok((info.storage_used, info.storage_max))
@@ -806,7 +807,7 @@ pub fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt_node_key, extract_folder_id_and_key};
+    use super::{decrypt_node_key, extract_folder_id_and_key, parse_quota, QuotaInfo};
     use crate::crypto::{
         aes_ecb_encrypt, encrypt_mega_attr, node_aes_key, url_base64_encode,
     };
