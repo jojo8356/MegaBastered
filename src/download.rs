@@ -219,23 +219,87 @@ pub async fn download_folder(
         });
     }
 
+    // --- Fast pre-check -----------------------------------------------------
+    // A single concurrent metadata pass tells what is already on disk, so a
+    // finished file costs one stat call and never triggers a download URL.
+    println!("\n  Verification des fichiers deja presents...");
+    let targets: Vec<(u64, PathBuf)> = files
+        .iter()
+        .map(|(node, relative)| (node.size, base.join(relative)))
+        .collect();
+    let states = scan_disk(&targets).await;
+
+    let mut pending: Vec<usize> = Vec::new();
+    let mut skipped_bytes = 0u64;
+    let mut cleaned = 0usize;
+
+    for (index, state) in states.iter().enumerate() {
+        match state {
+            DiskState::Complete => {
+                skipped_bytes += files[index].0.size;
+                if cleanup_sidecars(&targets[index].1).await {
+                    cleaned += 1;
+                }
+            }
+            DiskState::Partial(_) | DiskState::Missing => pending.push(index),
+        }
+    }
+
+    let complete = states.len() - pending.len();
+    let pending_bytes: u64 = pending.iter().map(|index| files[*index].0.size).sum();
+
+    println!(
+        "  {} fichier(s) deja complet(s) ({}) ignore(s)",
+        complete,
+        api::format_bytes(skipped_bytes)
+    );
+    println!(
+        "  {} fichier(s) a telecharger ou reprendre ({})",
+        pending.len(),
+        api::format_bytes(pending_bytes)
+    );
+    if cleaned > 0 {
+        println!(
+            "  {} fichier(s) temporaire(s) obsolete(s) nettoye(s)",
+            cleaned
+        );
+    }
+
+    if pending.is_empty() {
+        println!("\n  Tout est deja telecharge, rien a faire.");
+        return Ok(FolderReport {
+            downloaded: 0,
+            skipped: complete,
+            failed: 0,
+            quota_exhausted: false,
+        });
+    }
+
+    let sessions = pending_bytes.div_ceil(5 * 1024 * 1024 * 1024).max(1);
+    if pending_bytes > 5 * 1024 * 1024 * 1024 {
+        println!(
+            "  A ~5 Go par fenetre de 6 h (quota gratuit), prevoir ~{} session(s)",
+            sessions
+        );
+    }
+
     let started = Instant::now();
     let mut report = FolderReport {
         downloaded: 0,
-        skipped: 0,
+        skipped: complete,
         failed: 0,
         quota_exhausted: false,
     };
-    let mut skipped_bytes = 0u64;
     let mut done_bytes = 0u64;
     let mut failures: Vec<(String, String)> = Vec::new();
 
-    for (index, (node, relative)) in files.iter().enumerate() {
+    for (position, index) in pending.iter().enumerate() {
+        let (node, relative) = files[*index];
         let dest = base.join(relative);
         println!(
             "\n  [{}/{}] {} ({})",
-            index + 1,
-            files.len(),
+            position + 1,
+            pending.len(),
             relative.display(),
             api::format_bytes(node.size)
         );
@@ -258,6 +322,7 @@ pub async fn download_folder(
                 done_bytes += node.size;
             }
             Ok(false) => {
+                // Completed by another run in the meantime.
                 report.skipped += 1;
                 skipped_bytes += node.size;
                 println!("  Deja present, ignore");
@@ -270,7 +335,7 @@ pub async fn download_folder(
                 failures.push((relative.display().to_string(), FileError::Quota.to_string()));
                 println!(
                     "\n  Quota MEGA atteint (509). Arret du dossier: les {} fichier(s) restant(s) seront repris en relancant la meme commande.",
-                    files.len() - index - 1
+                    pending.len() - position - 1
                 );
                 break;
             }
@@ -911,6 +976,62 @@ async fn try_fetch_chunk(client: &Client, url: &str, expected: u64) -> Result<Ve
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// What a destination file looks like on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskState {
+    /// File present with the expected size.
+    Complete,
+    /// File present but not finished (bytes already on disk).
+    Partial(u64),
+    /// Nothing on disk yet.
+    Missing,
+}
+
+/// Classify a destination file from its size (if any) and the expected size.
+pub fn classify_disk(len: Option<u64>, expected: u64) -> DiskState {
+    match len {
+        Some(len) if len == expected => DiskState::Complete,
+        Some(len) if len > 0 => DiskState::Partial(len),
+        _ => DiskState::Missing,
+    }
+}
+
+/// Stat every target file concurrently.
+async fn scan_disk(targets: &[(u64, PathBuf)]) -> Vec<DiskState> {
+    let mut states = Vec::with_capacity(targets.len());
+
+    for chunk in targets.chunks(128) {
+        let futures = chunk.iter().map(|(size, path)| async move {
+            let len = tokio::fs::metadata(path)
+                .await
+                .ok()
+                .filter(|meta| meta.is_file())
+                .map(|meta| meta.len());
+            classify_disk(len, *size)
+        });
+        states.extend(futures::future::join_all(futures).await);
+    }
+
+    states
+}
+
+/// Remove the temp file and the resume index of a finished download.
+/// Returns true when something was actually deleted.
+async fn cleanup_sidecars(dest: &Path) -> bool {
+    let Some(name) = dest.file_name().map(|name| name.to_string_lossy().to_string()) else {
+        return false;
+    };
+
+    let mut removed = false;
+    for suffix in [TEMP_SUFFIX, PARTS_SUFFIX] {
+        let leftover = dest.with_file_name(format!("{}{}", name, suffix));
+        if leftover.exists() && tokio::fs::remove_file(&leftover).await.is_ok() {
+            removed = true;
+        }
+    }
+    removed
+}
+
 /// Read the sidecar of completed chunk offsets.
 async fn load_parts(path: &Path) -> HashSet<u64> {
     let mut offsets = HashSet::new();
@@ -1350,5 +1471,65 @@ mod tests {
         let other = anyhow!("MEGA API error -9 (element introuvable)");
         assert!(!is_quota_error(&other));
         assert!(matches!(classify_api_error(&other), FileError::Other(_)));
+    }
+
+    #[test]
+    fn disk_state_classification() {
+        assert_eq!(classify_disk(None, 100), DiskState::Missing);
+        assert_eq!(classify_disk(Some(0), 100), DiskState::Missing);
+        assert_eq!(classify_disk(Some(100), 100), DiskState::Complete);
+        assert_eq!(classify_disk(Some(40), 100), DiskState::Partial(40));
+        // Bigger than expected: the file is wrong, it will be downloaded again.
+        assert_eq!(classify_disk(Some(200), 100), DiskState::Partial(200));
+        // Empty files are legitimately complete at zero byte.
+        assert_eq!(classify_disk(Some(0), 0), DiskState::Complete);
+    }
+
+    #[tokio::test]
+    async fn scan_reports_each_target() {
+        let dir = std::env::temp_dir().join(format!("megacli-scan-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let done = dir.join("done.bin");
+        let partial = dir.join("partial.bin");
+        let missing = dir.join("missing.bin");
+        tokio::fs::write(&done, vec![0u8; 8]).await.unwrap();
+        tokio::fs::write(&partial, vec![0u8; 3]).await.unwrap();
+
+        let targets = vec![
+            (8u64, done.clone()),
+            (8, partial.clone()),
+            (8, missing.clone()),
+        ];
+        let states = scan_disk(&targets).await;
+
+        assert_eq!(states[0], DiskState::Complete);
+        assert_eq!(states[1], DiskState::Partial(3));
+        assert_eq!(states[2], DiskState::Missing);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn finished_files_lose_their_leftovers() {
+        let dir = std::env::temp_dir().join(format!("megacli-clean-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let dest = dir.join("video.mkv");
+        let tmp = dir.join(format!("video.mkv{}", TEMP_SUFFIX));
+        let parts = dir.join(format!("video.mkv{}", PARTS_SUFFIX));
+        for path in [&dest, &tmp, &parts] {
+            tokio::fs::write(path, b"x").await.unwrap();
+        }
+
+        assert!(cleanup_sidecars(&dest).await);
+        assert!(dest.exists(), "the finished file must be kept");
+        assert!(!tmp.exists());
+        assert!(!parts.exists());
+
+        // Nothing left to clean.
+        assert!(!cleanup_sidecars(&dest).await);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

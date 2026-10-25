@@ -232,11 +232,15 @@ async fn menu_stream(state: &mut AppState) {
 
     let players = &["mpv", "vlc", "ffplay"];
     let sel = Select::new()
-        .with_prompt("Lecteur")
+        .with_prompt("Lecteur  (q pour annuler)")
         .items(players)
         .default(0)
-        .interact()
-        .unwrap_or(0);
+        .interact_opt()
+        .ok()
+        .flatten();
+    let Some(sel) = sel else {
+        return;
+    };
     let player = players[sel];
 
     // Get file info
@@ -364,10 +368,12 @@ async fn menu_login(state: &mut AppState) {
 
         let choices = &["Changer de compte", "Deconnecter", "Retour"];
         let sel = Select::new()
-            .with_prompt("Action")
+            .with_prompt("Action  (q pour revenir)")
             .items(choices)
             .default(2)
-            .interact()
+            .interact_opt()
+            .ok()
+            .flatten()
             .unwrap_or(2);
 
         match sel {
@@ -459,10 +465,12 @@ async fn menu_settings(state: &mut AppState) {
         "Retour",
     ];
     let sel = Select::new()
-        .with_prompt("Modifier")
+        .with_prompt("Modifier  (q pour revenir)")
         .items(choices)
         .default(4)
-        .interact()
+        .interact_opt()
+        .ok()
+        .flatten()
         .unwrap_or(4);
 
     match sel {
@@ -651,30 +659,71 @@ async fn run_cli(args: CliArgs) -> Result<()> {
 
     if args.list {
         let entries = download::list_folder(&client, &args.link).await?;
+        let base = std::path::Path::new(&args.dest);
         let mut total = 0u64;
+        let mut remaining = 0u64;
         let mut files = 0usize;
+        let mut done = 0usize;
+        let mut partial = 0usize;
+
         for entry in &entries {
             total += entry.size;
             if entry.is_dir {
                 println!("  {}/", entry.path.display());
-            } else {
-                files += 1;
-                println!(
-                    "  {}  ({})",
-                    entry.path.display(),
-                    api::format_bytes(entry.size)
-                );
+                continue;
+            }
+
+            files += 1;
+            let path = base.join(&entry.path);
+            let len = std::fs::metadata(&path)
+                .ok()
+                .filter(|meta| meta.is_file())
+                .map(|meta| meta.len());
+
+            match download::classify_disk(len, entry.size) {
+                download::DiskState::Complete => {
+                    done += 1;
+                    println!(
+                        "  [ok]         {}  ({})",
+                        entry.path.display(),
+                        api::format_bytes(entry.size)
+                    );
+                }
+                download::DiskState::Partial(have) => {
+                    partial += 1;
+                    remaining += entry.size.saturating_sub(have);
+                    println!(
+                        "  [reprendre]  {}  ({})",
+                        entry.path.display(),
+                        api::format_bytes(entry.size)
+                    );
+                }
+                download::DiskState::Missing => {
+                    remaining += entry.size;
+                    println!(
+                        "  [manquant]   {}  ({})",
+                        entry.path.display(),
+                        api::format_bytes(entry.size)
+                    );
+                }
             }
         }
+
         println!(
-            "\n  {} fichier(s), {} au total. Dossier de destination: {}",
+            "\n  {} fichier(s), {} au total. Dossier verifie: {}",
             files,
             api::format_bytes(total),
             args.dest
         );
         println!(
-            "  A ~5 Go par fenetre de 6 h (quota gratuit), prevois environ {} session(s).",
-            (total / (5 * 1024 * 1024 * 1024)).max(1)
+            "  {} deja complet(s), {} a reprendre, reste {} a telecharger",
+            done,
+            partial,
+            api::format_bytes(remaining)
+        );
+        println!(
+            "  A ~5 Go par fenetre de 6 h (quota gratuit), prevoir environ {} session(s).",
+            remaining.div_ceil(5 * 1024 * 1024 * 1024).max(1)
         );
         return Ok(());
     }
@@ -752,22 +801,22 @@ async fn main() -> Result<()> {
         println!();
 
         let sel = Select::new()
-            .with_prompt("Action")
+            .with_prompt("Action  (q ou Echap pour quitter)")
             .items(menu_items)
             .default(0)
-            .interact();
+            .interact_opt();
 
         match sel {
-            Ok(0) => menu_download_link(&mut state).await,
-            Ok(1) => menu_download_cloud(&mut state).await,
-            Ok(2) => menu_upload(&mut state).await,
-            Ok(3) => menu_list_files(&mut state).await,
-            Ok(4) => menu_stream(&mut state).await,
-            Ok(5) => menu_quota(&mut state).await,
-            Ok(6) => menu_mkdir(&mut state).await,
-            Ok(7) => menu_login(&mut state).await,
-            Ok(8) => menu_settings(&mut state).await,
-            Ok(9) | Err(_) => {
+            Ok(Some(0)) => menu_download_link(&mut state).await,
+            Ok(Some(1)) => menu_download_cloud(&mut state).await,
+            Ok(Some(2)) => menu_upload(&mut state).await,
+            Ok(Some(3)) => menu_list_files(&mut state).await,
+            Ok(Some(4)) => menu_stream(&mut state).await,
+            Ok(Some(5)) => menu_quota(&mut state).await,
+            Ok(Some(6)) => menu_mkdir(&mut state).await,
+            Ok(Some(7)) => menu_login(&mut state).await,
+            Ok(Some(8)) => menu_settings(&mut state).await,
+            Ok(Some(9)) | Ok(None) | Err(_) => {
                 println!("Bye!");
                 break;
             }
