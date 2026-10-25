@@ -1068,11 +1068,10 @@ mod tests {
 
     #[test]
     fn truncated_folder_key_is_reported_clearly() {
-        let error = extract_folder_id_and_key(
-            "https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw](https:",
-        )
-        .unwrap_err()
-        .to_string();
+        // A key with a character that cannot be base64.
+        let error = extract_folder_id_and_key("https://mega.nz/folder/2wkxkQAB#IbHZz1k*P9KvTp9u")
+            .unwrap_err()
+            .to_string();
 
         assert!(
             error.contains("cle de dossier illisible"),
