@@ -449,6 +449,8 @@ async fn download_file(
     }
 
     let (aes_key, aes_iv) = derive_file_keys(file_key).map_err(|e| FileError::Other(e.to_string()))?;
+    let aes_key = Arc::new(aes_key);
+    let aes_iv = Arc::new(aes_iv);
     let chunks = build_chunks(file_size);
     let workers = config.workers.clamp(1, MAX_WORKERS);
 
