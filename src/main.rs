@@ -16,6 +16,18 @@ struct AppState {
     download_path: String,
     workers: usize,
     speed_limit: u64,
+    /// How long to pause when MEGA answers HTTP 509 (0 = do not wait).
+    quota_wait: std::time::Duration,
+}
+
+impl AppState {
+    fn download_config(&self) -> download::DownloadConfig {
+        download::DownloadConfig {
+            workers: self.workers,
+            speed_limit: self.speed_limit,
+            quota_wait: self.quota_wait,
+        }
+    }
 }
 
 fn clear() {
@@ -74,23 +86,42 @@ async fn menu_download_link(state: &mut AppState) {
     }
     println!("  Destination: {}", path);
     println!("  Connexions:  {}", workers);
+    println!(
+        "  Quota 509:   {}",
+        if state.quota_wait.is_zero() {
+            "arret et reprise plus tard".to_string()
+        } else {
+            format!("attente de {} min puis reprise", state.quota_wait.as_secs() / 60)
+        }
+    );
     println!();
 
+    let mut config = state.download_config();
+    config.workers = workers;
+
     let result = if folder {
-        download::download_folder(&state.client, &link, &path, workers, state.speed_limit).await
+        download::download_folder(&state.client, &link, &path, config)
+            .await
+            .map(|report| {
+                if report.quota_exhausted {
+                    println!("\n  Dossier interrompu par le quota MEGA (reprise possible)");
+                } else if report.failed == 0 {
+                    println!("\n  Dossier telecharge!");
+                } else {
+                    println!(
+                        "\n  Dossier partiellement telecharge ({} en echec)",
+                        report.failed
+                    );
+                }
+            })
     } else {
-        download::download_from_link(&state.client, &link, &path, workers, state.speed_limit).await
+        download::download_from_link(&state.client, &link, &path, config)
+            .await
+            .map(|_| println!("\n  Telechargement termine!"))
     };
 
-    match result {
-        Ok(()) => {
-            if folder {
-                println!("\n  Dossier telecharge!");
-            } else {
-                println!("\n  Telechargement termine!");
-            }
-        }
-        Err(e) => println!("\n  Erreur: {}", e),
+    if let Err(e) = result {
+        println!("\n  Erreur: {}", e);
     }
 
     pause();
@@ -410,20 +441,29 @@ async fn menu_settings(state: &mut AppState) {
             state.speed_limit.to_string()
         }
     );
+    println!(
+        "  4. Attente quota 509:         {}",
+        if state.quota_wait.is_zero() {
+            "desactivee (arret propre)".to_string()
+        } else {
+            format!("{} min", state.quota_wait.as_secs() / 60)
+        }
+    );
     println!();
 
     let choices = &[
         "Changer dossier de telechargement",
         "Changer connexions paralleles",
         "Changer limite de vitesse",
+        "Changer attente quota 509",
         "Retour",
     ];
     let sel = Select::new()
         .with_prompt("Modifier")
         .items(choices)
-        .default(3)
+        .default(4)
         .interact()
-        .unwrap_or(3);
+        .unwrap_or(4);
 
     match sel {
         0 => {
@@ -436,6 +476,14 @@ async fn menu_settings(state: &mut AppState) {
         2 => {
             let s = ask_default("Limite KiB/s (0 = illimite)", &state.speed_limit.to_string());
             state.speed_limit = s.parse().unwrap_or(0);
+        }
+        3 => {
+            let current = state.quota_wait.as_secs() / 60;
+            let s = ask_default(
+                "Attente apres HTTP 509, en minutes (0 = ne pas attendre)",
+                &current.to_string(),
+            );
+            state.quota_wait = std::time::Duration::from_secs(s.parse::<u64>().unwrap_or(0) * 60);
         }
         _ => {}
     }
@@ -477,24 +525,202 @@ fn print_file_tree(nodes: &[api::FileNode]) {
     print_node(nodes, root_handle, 0);
 }
 
-// --- Main ---
+// --- Mode ligne de commande (scriptable) ---
 
-#[tokio::main]
-async fn main() -> Result<()> {
+struct CliArgs {
+    link: String,
+    dest: String,
+    workers: usize,
+    speed_limit: u64,
+    quota_wait: std::time::Duration,
+    list: bool,
+}
+
+fn print_cli_help() {
+    println!(
+        "MegaCLI v{} - client MEGA en Rust\n\n\
+Usage:\n  \
+  megacli                          menu interactif\n  \
+  megacli <lien> [options]         telechargement direct (fichier ou dossier)\n  \
+  megacli --list <lien>            affiche l'arborescence sans rien telecharger\n\n\
+Options:\n  \
+  -d, --dest <dir>        dossier de destination (defaut: dossier Telechargements)\n  \
+  -w, --workers <1-20>    connexions paralleles par fichier (defaut: 6)\n  \
+  -s, --speed <KiB/s>     limite de vitesse, 0 = illimite (defaut: 0)\n  \
+  -q, --quota-wait <min>  en cas de quota MEGA (HTTP 509), attendre N minutes\n                          \
+puis reprendre au lieu de s'arreter (defaut: 0)\n  \
+  -l, --list              lister le contenu du dossier\n  \
+  -h, --help              cette aide\n\n\
+Codes de sortie: 0 succes, 1 erreur, 2 quota MEGA atteint (relancer plus tard).",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// Returns `None` when no link was given (interactive menu).
+fn parse_cli() -> Option<CliArgs> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return None;
+    }
+
+    let mut link: Option<String> = None;
+    let mut dest: Option<String> = None;
+    let mut workers = DEFAULT_WORKERS;
+    let mut speed_limit = 0u64;
+    let mut quota_wait_min = 0u64;
+    let mut list = false;
+
+    let mut index = 0usize;
+    while index < args.len() {
+        let current = args[index].clone();
+        match current.as_str() {
+            "-h" | "--help" => {
+                print_cli_help();
+                std::process::exit(0);
+            }
+            "-l" | "--list" => list = true,
+            "-d" | "--dest" => {
+                index += 1;
+                dest = args.get(index).cloned();
+            }
+            "-w" | "--workers" => {
+                index += 1;
+                workers = args
+                    .get(index)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(DEFAULT_WORKERS)
+                    .clamp(1, 20);
+            }
+            "-s" | "--speed" => {
+                index += 1;
+                speed_limit = args
+                    .get(index)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+            "-q" | "--quota-wait" => {
+                index += 1;
+                quota_wait_min = args
+                    .get(index)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+            other if !other.starts_with('-') => link = Some(other.to_string()),
+            other => {
+                eprintln!("Option inconnue: {} (voir --help)", other);
+                std::process::exit(1);
+            }
+        }
+
+        index += 1;
+    }
+
+    let link = match link {
+        Some(link) => link,
+        None => {
+            eprintln!("Aucun lien MEGA fourni (voir --help)");
+            std::process::exit(1);
+        }
+    };
+
+    Some(CliArgs {
+        link,
+        dest: dest.unwrap_or_else(default_download_dir),
+        workers,
+        speed_limit,
+        quota_wait: std::time::Duration::from_secs(quota_wait_min * 60),
+        list,
+    })
+}
+
+fn default_download_dir() -> String {
+    dirs::download_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+async fn run_cli(args: CliArgs) -> Result<()> {
+    if !api::is_mega_link(&args.link) {
+        eprintln!("Lien MEGA invalide: {}", args.link);
+        std::process::exit(1);
+    }
+
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
-    let download_path = dirs::download_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".".to_string());
+    if args.list {
+        let entries = download::list_folder(&client, &args.link).await?;
+        let mut total = 0u64;
+        let mut files = 0usize;
+        for entry in &entries {
+            total += entry.size;
+            if entry.is_dir {
+                println!("  {}/", entry.path.display());
+            } else {
+                files += 1;
+                println!(
+                    "  {}  ({})",
+                    entry.path.display(),
+                    api::format_bytes(entry.size)
+                );
+            }
+        }
+        println!(
+            "\n  {} fichier(s), {} au total. Dossier de destination: {}",
+            files,
+            api::format_bytes(total),
+            args.dest
+        );
+        println!(
+            "  A ~5 Go par fenetre de 6 h (quota gratuit), prevois environ {} session(s).",
+            (total / (5 * 1024 * 1024 * 1024)).max(1)
+        );
+        return Ok(());
+    }
+
+    let config = download::DownloadConfig {
+        workers: args.workers,
+        speed_limit: args.speed_limit,
+        quota_wait: args.quota_wait,
+    };
+
+    if api::is_folder_link(&args.link) {
+        println!("Dossier: {}", args.link);
+        println!("Destination: {}", args.dest);
+        let report = download::download_folder(&client, &args.link, &args.dest, config).await?;
+        if report.quota_exhausted {
+            std::process::exit(2);
+        }
+        if report.failed > 0 {
+            std::process::exit(1);
+        }
+    } else {
+        download::download_from_link(&client, &args.link, &args.dest, config).await?;
+    }
+
+    Ok(())
+}
+
+// --- Main ---
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    if let Some(args) = parse_cli() {
+        return run_cli(args).await;
+    }
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
 
     let mut state = AppState {
         client,
         session: None,
-        download_path,
+        download_path: default_download_dir(),
         workers: DEFAULT_WORKERS,
         speed_limit: 0,
+        quota_wait: std::time::Duration::ZERO,
     };
 
     let title = Style::new().bold().green();
