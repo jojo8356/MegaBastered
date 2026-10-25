@@ -732,16 +732,64 @@ impl FileNode {
 
 // --- Link parsing helpers ---
 
+/// Characters that are never part of a MEGA link but often come along when the
+/// link is copied from a chat, a markdown document or an e-mail.
+const LINK_WRAPPERS: &str = "\"'`<>«»“”‘’()[]{}";
+
+/// Extract the actual MEGA URL from whatever the user pasted.
+///
+/// Handles the usual copy/paste accidents:
+/// - markdown `[label](https://mega.nz/...)`
+/// - quotes, backticks or angle brackets around the link
+/// - trailing punctuation (`.`, `,`, `)`, ...)
+/// - leading text ("tiens: https://mega.nz/...")
+pub fn clean_link_input(input: &str) -> String {
+    let trimmed = input.trim();
+
+    // Markdown link: keep the target, not the label.
+    let markdown = regex::Regex::new(r"\[[^\]]*\]\(([^)\s]+)\)").unwrap();
+    let text = match markdown.captures(trimmed) {
+        Some(caps) => caps[1].to_string(),
+        None => trimmed.to_string(),
+    };
+
+    // Take the first MEGA URL found in the text.
+    let url = regex::Regex::new(
+        r#"(?i)(?:https?://)?mega\.(?:nz|co\.nz)/[^\s)\]}>"'«»]+"#,
+    )
+    .unwrap();
+    if let Some(found) = url.find(&text) {
+        return found.as_str().to_string();
+    }
+
+    // No recognisable URL: just drop wrappers and trailing punctuation.
+    text.trim_matches(|c: char| c.is_whitespace() || LINK_WRAPPERS.contains(c))
+        .trim_end_matches(['.', ',', ';', ':', '!', '?'])
+        .to_string()
+}
+
 pub fn normalize_mega_link(link: &str) -> String {
-    let mut s = link.to_string();
-    // New format -> legacy
+    let mut s = clean_link_input(link);
+
+    // New format -> legacy. Keys stop at anything that cannot belong to a
+    // base64 URL-safe key, so a link pasted with trailing junk stays valid.
+    let key = r#"[^\s)\]}>"'«»]+"#;
     let patterns = [
-        (r"mega\.nz/file/([^#]+)#([^\s]+)", "https://mega.nz/#!$1!$2"),
-        (r"mega\.nz/folder/([^#]+)#([^\s/]+)/file/([^\s/]+)", "https://mega.nz/#F*$3!$1!$2"),
-        (r"mega\.nz/folder/([^#]+)#([^\s]+)", "https://mega.nz/#F!$1!$2"),
+        (
+            format!(r"mega\.nz/file/([^#]+)#({})", key),
+            "https://mega.nz/#!$1!$2",
+        ),
+        (
+            r#"mega\.nz/folder/([^#]+)#([^\s)\]}>"'«»/]+)/file/([^\s)\]}>"'«»/]+)"#.to_string(),
+            "https://mega.nz/#F*$3!$1!$2",
+        ),
+        (
+            format!(r"mega\.nz/folder/([^#]+)#({})", key),
+            "https://mega.nz/#F!$1!$2",
+        ),
     ];
     for (pat, rep) in patterns {
-        let re = regex::Regex::new(pat).unwrap();
+        let re = regex::Regex::new(&pat).unwrap();
         s = re.replace(&s, rep).to_string();
     }
     if !s.starts_with("http") && s.contains("mega.nz") {
@@ -780,8 +828,20 @@ pub fn extract_folder_id_and_key(link: &str) -> Result<(String, String)> {
     let re = regex::Regex::new(r"#F!([^!]+)!([^!#\s/]+)")?;
     let caps = re
         .captures(&link)
-        .ok_or(anyhow!("lien de dossier invalide"))?;
-    Ok((caps[1].to_string(), caps[2].to_string()))
+        .ok_or_else(|| anyhow!("lien de dossier invalide: {}", clean_link_input(&link)))?;
+
+    let folder_id = caps[1].to_string();
+    let folder_key = caps[2].to_string();
+
+    // A valid folder key is base64 (URL-safe, usually unpadded).
+    if url_base64_decode(&folder_key).is_err() {
+        return Err(anyhow!(
+            "cle de dossier illisible ({}). Verifie que le lien est complet et sans texte colle autour.",
+            clean_link_input(&link)
+        ));
+    }
+
+    Ok((folder_id, folder_key))
 }
 
 pub fn is_folder_link(link: &str) -> bool {
@@ -790,7 +850,8 @@ pub fn is_folder_link(link: &str) -> bool {
 }
 
 pub fn is_mega_link(link: &str) -> bool {
-    link.contains("mega.nz") || link.contains("mega.co.nz")
+    let cleaned = clean_link_input(link);
+    cleaned.contains("mega.nz") || cleaned.contains("mega.co.nz")
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -970,5 +1031,53 @@ mod tests {
         assert_eq!(info, QuotaInfo::default());
         assert!(!info.has_account_transfer());
         assert!(!info.account_exhausted());
+    }
+
+    #[test]
+    fn links_survive_a_messy_copy_paste() {
+        use super::clean_link_input;
+
+        let expected = "https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw";
+
+        // Markdown link wrapped in quotes (what chat clients produce).
+        let pasted = "'[https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw](https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw)'";
+        assert_eq!(clean_link_input(pasted), expected);
+
+        // And the folder parsing must work on it.
+        let (id, key) = extract_folder_id_and_key(pasted).unwrap();
+        assert_eq!(id, "2wkxkQAB");
+        assert_eq!(key, "IbHZz1kP9KvTp9uTJ2iOLw");
+
+        // Quotes, angle brackets, trailing period.
+        assert_eq!(
+            clean_link_input("\"https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw\"."),
+            expected
+        );
+        assert_eq!(
+            clean_link_input("<https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw>"),
+            expected
+        );
+        assert_eq!(
+            clean_link_input("tiens: https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw ok ?"),
+            expected
+        );
+
+        // Already clean.
+        assert_eq!(clean_link_input(expected), expected);
+    }
+
+    #[test]
+    fn truncated_folder_key_is_reported_clearly() {
+        let error = extract_folder_id_and_key(
+            "https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw](https:",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("cle de dossier illisible"),
+            "unexpected message: {}",
+            error
+        );
     }
 }

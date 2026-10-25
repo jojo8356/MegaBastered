@@ -76,10 +76,12 @@ async fn menu_download_link(state: &mut AppState) {
     }
 
     if !api::is_mega_link(&link) {
-        println!("\n  Lien MEGA invalide!");
+        println!("\n  Lien MEGA invalide: {}", api::clean_link_input(&link));
+        println!("  Format attendu: https://mega.nz/folder/<id>#<cle>");
         pause();
         return;
     }
+    let link = api::clean_link_input(&link);
 
     let path = ask_default("Dossier destination", &state.download_path);
     let workers_str = ask_default("Connexions paralleles", &state.workers.to_string());
@@ -788,9 +790,12 @@ async fn print_quota(client: &Client, sid: Option<&str>) -> Result<()> {
 
 async fn run_cli(args: CliArgs) -> Result<()> {
     if !api::is_mega_link(&args.link) {
-        eprintln!("Lien MEGA invalide: {}", args.link);
+        eprintln!("Lien MEGA invalide: {}", api::clean_link_input(&args.link));
+        eprintln!("Format attendu: https://mega.nz/folder/<id>#<cle>");
         std::process::exit(1);
     }
+    let mut args = args;
+    args.link = api::clean_link_input(&args.link);
 
     let client = build_client(args.proxy.as_deref())?;
 
