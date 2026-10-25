@@ -916,7 +916,8 @@ mod tests {
         });
 
         let info = parse_quota(&payload);
-        assert_eq!(info.ip_buckets.len(), 6);
+        // Empty buckets are sent as -1 and skipped.
+        assert_eq!(info.ip_buckets.len(), 3);
         assert_eq!(info.ip_transfer_used(), 3_500_000_000);
         assert_eq!(info.bucket_age, Some(7200));
         assert_eq!(info.transfer_reserved, 12_345);
@@ -943,6 +944,7 @@ mod tests {
         assert_eq!(info.transfer_max, 1_099_511_627_776);
         assert_eq!(info.transfer_used, 255_000_000_000);
         assert_eq!(info.transfer_served, 3_000_000_000);
+        assert!(info.ip_buckets.is_empty());
         assert_eq!(info.ip_transfer_used(), 0);
         assert!(!info.account_exhausted());
     }
