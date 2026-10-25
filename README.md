@@ -14,7 +14,7 @@ No Java, no Electron, no bloat. Just a single binary that handles downloads, upl
 - **Folder downloads** - Download a whole public folder (or sub-folder): tree is recreated, every file is decrypted with its own node key, already downloaded files are skipped
 - **Resumable transfers** - Per-chunk index (`.megacli.parts`): an interrupted download resumes exactly where it stopped, and a partial file is never reported as complete
 - **Quota aware** - asks MEGA how much transfer quota is left for your IP (`--quota`), stops cleanly on HTTP 509 and can wait/resume on its own (`--quota-wait`)
-- **Proxy support** - route every MEGA request through your own HTTP/SOCKS5 proxy or VPN endpoint (`--proxy`)
+- **Proxy support** - route every MEGA request through your own HTTP/SOCKS5 proxy or VPN endpoint (`--proxy`), or feed a whole `proxies.txt` list with `--proxy-file`
 - **Forgiving links** - links pasted from a chat as `[label](url)`, inside quotes, angle brackets or a sentence are understood
 - **Scriptable CLI** - `megacli <link>` to download, `megacli --list <link> [-d dest]` to see what is already done
 - **Instant re-runs** - a concurrent pre-scan of the destination lists what is already complete, those files are never touched again and their leftovers are cleaned
@@ -98,9 +98,50 @@ itself: the DNS query then never leaves your machine's side of the tunnel, so
 MEGA (and your ISP) cannot see which domain you resolve. With `socks5://` the
 name is resolved locally first.
 
-In the interactive menu: *Parametres -> 5. Changer le proxy*. The current proxy
-is shown in the header, and an invalid URL is refused instead of silently
-disabling networking.
+### A whole proxy list in a file (`--proxy-file`)
+
+Like MegaBasterd's proxy list, one entry per line:
+
+```text
+# proxies.txt - lines starting with # are ignored
+1.2.3.4:8080                 HTTP proxy
+*5.6.7.8:1080                SOCKS5 (MegaBasterd's leading * marker)
+socks5h://127.0.0.1:9050     Tor / SSH tunnel, DNS resolved by the proxy
+user:pass@9.9.9.9:3128       proxy with credentials
+9.9.9.9:3128@Ym9iOnNlY3JldA  credentials as base64(user:pass), MegaBasterd style
+```
+
+```bash
+# Start from the first proxy of the list
+./megacli "<lien>" -d ~/Documents/Formations --proxy-file proxies.txt
+
+# Start from a random entry of the list
+./megacli "<lien>" -d ~/Documents/Formations --proxy-file proxies.txt --proxy-mode random
+
+# Which proxies work, and how much quota is left on each exit IP?
+./megacli --proxy-file proxies.txt --proxy-check
+
+# Or export it once for every run (CLI and interactive menu)
+export MEGACLI_PROXY_FILE=~/proxies.txt
+```
+
+`--proxy-check` asks MEGA for the transfer quota **through each proxy** and
+prints latency plus the bytes already used on that exit IP, so you can pick the
+least-loaded exit. Duplicate lines and malformed lines are dropped (up to 5000
+entries are read).
+
+Rules kept on purpose:
+
+- **one** exit is chosen at startup (`--proxy-mode first|random`), then the whole
+  run uses it - the client never jumps from proxy to proxy mid-download;
+- when MEGA answers 509, the run stops with exit code `2` and prints another
+  entry of your list to continue with;
+- `--proxy` / `MEGACLI_PROXY` win over the list file (one explicit proxy).
+
+In the interactive menu: *Parametres -> 5. Changer le proxy* and
+*Parametres -> 6. Charger une liste de proxies (.txt)*. The current proxy - and
+its position in the list - is shown in the header, and an invalid URL is refused
+instead of silently disabling networking.
 
 DNS itself has nothing to do with MEGA's quota: the limit follows the **exit IP**
 of your connection, not the resolver. Changing `/etc/resolv.conf` or macOS
@@ -186,8 +227,9 @@ What this client does about it:
 
 What is left is done by MEGA, not by the client: waiting for the rolling window
 (the honest "bypass"), using a paid plan, or routing your own traffic through
-your own VPN/proxy with `--proxy`. The client does **not** rotate proxies/VPNs
-automatically to farm free quota: that is against MEGA's terms of service.
+your own VPN/proxy with `--proxy` or `--proxy-file`. The client does **not**
+rotate proxies/VPNs automatically to farm free quota: that is against MEGA's
+terms of service. A list only changes which exit a run *starts* from.
 
 Two practical details that save quota:
 
