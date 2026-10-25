@@ -729,10 +729,24 @@ fn env_proxy() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Accept only the proxy URL shapes reqwest can actually use.
+fn validate_proxy(url: &str) -> Result<()> {
+    let lower = url.to_ascii_lowercase();
+    let supported = ["http://", "https://", "socks5://", "socks5h://", "socks4://"];
+    if supported.iter().any(|prefix| lower.starts_with(prefix)) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "scheme non supporte (attendu http://, https://, socks5:// ou socks5h://)"
+        ))
+    }
+}
+
 fn build_client(proxy: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder().timeout(std::time::Duration::from_secs(120));
 
     if let Some(url) = proxy {
+        validate_proxy(url)?;
         let proxy = reqwest::Proxy::all(url)
             .map_err(|e| anyhow::anyhow!("proxy invalide ({}): {}", url, e))?;
         builder = builder.proxy(proxy);
@@ -1039,9 +1053,19 @@ mod tests {
     use crate::api::QuotaInfo;
 
     #[test]
-    fn invalid_proxy_is_rejected() {
-        assert!(build_client(Some("pas-une-url")).is_err());
+    fn proxy_urls_are_validated() {
+        use super::validate_proxy;
+
+        assert!(validate_proxy("socks5h://127.0.0.1:9050").is_ok());
+        assert!(validate_proxy("socks5://127.0.0.1:1080").is_ok());
+        assert!(validate_proxy("http://127.0.0.1:8080").is_ok());
+        assert!(validate_proxy("SOCKS5H://127.0.0.1:9050").is_ok());
+
+        assert!(validate_proxy("pas-une-url").is_err());
+        assert!(validate_proxy("127.0.0.1:9050").is_err());
+
         assert!(build_client(Some("socks5h://127.0.0.1:9050")).is_ok());
+        assert!(build_client(Some("pas-une-url")).is_err());
         assert!(build_client(None).is_ok());
     }
 
