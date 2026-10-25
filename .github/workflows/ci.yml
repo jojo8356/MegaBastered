@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check
+        run: cargo check --all-targets
+
+      - name: Test
+        shell: bash
+        run: |
+          set +e
+          cargo test --all-targets > test-output.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            # Surface the failures as annotations (job logs are not always
+            # reachable from automation).
+            sed -e 's/\x1b\[[0-9;]*m//g' test-output.log \
+              | grep -E "(panicked at|assertion|left:|right:|^thread |^---- |^test .* FAILED)" \
+              | head -80 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+            tail -30 test-output.log
+            exit $status
+          fi
+          grep -E "^test result" test-output.log
+
+      - name: Clippy
+        shell: bash
+        run: |
+          set +e
+          cargo clippy --all-targets --message-format=short -- -D warnings > clippy.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            sed -e 's/\x1b\[[0-9;]*m//g' clippy.log \
+              | grep -E "(error|warning)(\[|:)" \
+              | while IFS= read -r line; do echo "::error::$line"; done
+            tail -40 clippy.log
+            exit $status
+          fi
+
+      - name: Build release
+        run: cargo build --release

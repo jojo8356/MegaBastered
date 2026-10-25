@@ -118,8 +118,63 @@ pub async fn raw_api_request_with_node(
         .await?;
 
     let text = resp.text().await?;
+    if text.trim().is_empty() {
+        return Err(anyhow!("Reponse vide de l'API MEGA"));
+    }
     let val: Value = serde_json::from_str(&text)?;
+    check_api_error(&val)?;
     Ok(val)
+}
+
+/// Turn a `-N` MEGA error payload into a readable error.
+fn check_api_error(val: &Value) -> Result<()> {
+    let code = match val.as_i64() {
+        Some(code) => Some(code),
+        None => val
+            .as_array()
+            .filter(|a| a.len() == 1)
+            .and_then(|a| a[0].as_i64()),
+    };
+
+    if let Some(code) = code {
+        if code < 0 && code != -1 && code != -3 {
+            return Err(anyhow!(
+                "MEGA API error {} ({})",
+                code,
+                mega_error_hint(code)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mega_error_hint(code: i64) -> &'static str {
+    match code {
+        -2 => "argument invalide",
+        -4 => "trop de requetes, reessayez dans un instant",
+        -8 => "lien expire",
+        -9 => "element introuvable ou supprime",
+        -11 => "acces refuse",
+        -16 => "compte bloque",
+        -17 => "quota de transfert depasse",
+        -18 => "service temporairement indisponible",
+        _ => "erreur inconnue",
+    }
+}
+
+/// Get a download URL for a node of a public folder.
+pub async fn get_node_download_url(
+    client: &Client,
+    folder_id: &str,
+    node_handle: &str,
+) -> Result<String> {
+    let request = format!(r#"[{{"a":"g","g":"1","n":"{}"}}]"#, node_handle);
+    let res = raw_api_request_with_node(client, &request, None, folder_id).await?;
+
+    res[0]["g"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("Pas d'URL de telechargement pour le noeud {}", node_handle))
 }
 
 // --- Check account version ---
@@ -152,7 +207,7 @@ pub async fn login(client: &Client, email: &str, password: &str, pincode: Option
         // Legacy login
         let _key_bytes = email.to_lowercase().as_bytes().to_vec();
         // Pad to multiple of 4 for i32a
-        let key_i32 = bin_to_i32a(&password.as_bytes().to_vec());
+        let key_i32 = bin_to_i32a(password.as_bytes());
         let pkey = mega_prepare_master_key(&key_i32)?;
         let uh = mega_user_hash(email.to_lowercase().as_bytes(), &pkey)?;
         (pkey.to_vec(), uh)
@@ -437,33 +492,11 @@ pub async fn list_files(client: &Client, session: &MegaSession) -> Result<Vec<Fi
             let s = node["s"].as_u64().unwrap_or(0);
 
             // Try to decrypt attributes
-            let mut name = h.clone();
-            if let Some(k_str) = node["k"].as_str() {
-                if let Some(key_part) = k_str.split(':').nth(1) {
-                    if let Ok(enc_key) = url_base64_decode(key_part) {
-                        if let Ok(dec_key) = aes_ecb_decrypt(&enc_key, &master_key_bin) {
-                            if let Some(at) = node["a"].as_str() {
-                                let file_key = if dec_key.len() >= 32 {
-                                    let ik = bin_to_i32a(&dec_key[..32]);
-                                    i32a_to_bin(&[
-                                        ik[0] ^ ik[4],
-                                        ik[1] ^ ik[5],
-                                        ik[2] ^ ik[6],
-                                        ik[3] ^ ik[7],
-                                    ])
-                                } else {
-                                    dec_key[..16.min(dec_key.len())].to_vec()
-                                };
-                                if let Ok(attrs) = decrypt_mega_attr(at, &file_key) {
-                                    if let Some(n) = attrs["n"].as_str() {
-                                        name = n.to_string();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let (name, node_key) = match decrypt_node_key(node, &master_key_bin) {
+                Some((key, Some(name))) => (name, key),
+                Some((key, None)) => (h.clone(), key),
+                None => (h.clone(), String::new()),
+            };
 
             nodes.push(FileNode {
                 handle: h,
@@ -471,11 +504,57 @@ pub async fn list_files(client: &Client, session: &MegaSession) -> Result<Vec<Fi
                 node_type: t as i32,
                 size: s,
                 name,
+                key: node_key,
             });
         }
     }
 
     Ok(nodes)
+}
+
+/// Decrypt a node key coming from a listing entry.
+///
+/// MEGA sends `<handle>:<base64 key>` and, for imported/shared nodes, several
+/// keys separated by `/` (one per sharing chain). Every segment is tried until
+/// one of them decrypts the node attributes.
+///
+/// Returns the full node key (base64 of the 32 raw bytes, as used in file
+/// links) and the decrypted name when available.
+fn decrypt_node_key(node: &Value, wrapping_key: &[u8]) -> Option<(String, Option<String>)> {
+    let k_str = node["k"].as_str()?;
+    let attr = node["a"].as_str();
+    let mut fallback: Option<String> = None;
+
+    for segment in k_str.split('/') {
+        let encoded = segment.rsplit(':').next().unwrap_or(segment);
+        if encoded.is_empty() {
+            continue;
+        }
+
+        let enc_key = match url_base64_decode(encoded) {
+            Ok(key) => key,
+            Err(_) => continue,
+        };
+        let dec_key = match aes_ecb_decrypt(&enc_key, wrapping_key) {
+            Ok(key) => key,
+            Err(_) => continue,
+        };
+        let key_b64 = url_base64_encode(&dec_key);
+
+        if let Some(attr) = attr {
+            if let Ok(attrs) = decrypt_mega_attr(attr, &node_aes_key(&dec_key)) {
+                if let Some(name) = attrs["n"].as_str() {
+                    return Some((key_b64, Some(name.to_string())));
+                }
+            }
+        }
+
+        if fallback.is_none() {
+            fallback = Some(key_b64);
+        }
+    }
+
+    fallback.map(|key| (key, None))
 }
 
 // --- Get folder nodes (public folder link) ---
@@ -498,28 +577,11 @@ pub async fn get_folder_nodes(
             let t = node["t"].as_i64().unwrap_or(-1);
             let s = node["s"].as_u64().unwrap_or(0);
 
-            let mut name = h.clone();
-            #[allow(unused_assignments)]
-            let mut node_key_str = String::new();
-
-            if let Some(k_str) = node["k"].as_str() {
-                let parts: Vec<&str> = k_str.split(':').collect();
-                if parts.len() == 2 && !parts[1].is_empty() {
-                    if let Ok(enc_key) = url_base64_decode(parts[1]) {
-                        if let Ok(dec_key) = aes_ecb_decrypt(&enc_key, &folder_key_bytes) {
-                            node_key_str = url_base64_encode(&dec_key);
-                            let file_key = url_base64_key_decode(&node_key_str).unwrap_or(dec_key);
-                            if let Some(at) = node["a"].as_str() {
-                                if let Ok(attrs) = decrypt_mega_attr(at, &file_key) {
-                                    if let Some(n) = attrs["n"].as_str() {
-                                        name = n.to_string();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let (name, node_key) = match decrypt_node_key(node, &folder_key_bytes) {
+                Some((key, Some(name))) => (name, key),
+                Some((key, None)) => (h.clone(), key),
+                None => (h.clone(), String::new()),
+            };
 
             nodes.push(FileNode {
                 handle: h,
@@ -527,6 +589,7 @@ pub async fn get_folder_nodes(
                 node_type: t as i32,
                 size: s,
                 name,
+                key: node_key,
             });
         }
     }
@@ -543,6 +606,20 @@ pub struct FileNode {
     pub node_type: i32, // 0=file, 1=folder, 2=root, 3=inbox, 4=trash
     pub size: u64,
     pub name: String,
+    /// URL-safe base64 of the decrypted node key (32 bytes, or 16 bytes for
+    /// legacy nodes). This is the `handle:key` part of a MEGA file link and is
+    /// what the download engine needs to decrypt the file.
+    pub key: String,
+}
+
+impl FileNode {
+    pub fn is_file(&self) -> bool {
+        self.node_type == 0
+    }
+
+    pub fn is_folder(&self) -> bool {
+        self.node_type == 1
+    }
 }
 
 // --- Link parsing helpers ---
@@ -588,8 +665,14 @@ pub fn extract_n_folder_id(link: &str) -> Result<String> {
 
 pub fn extract_folder_id_and_key(link: &str) -> Result<(String, String)> {
     let link = normalize_mega_link(link);
-    let re = regex::Regex::new(r"#F!([^!]+)!([^!#\s]+)")?;
-    let caps = re.captures(&link).ok_or(anyhow!("Cannot parse folder link"))?;
+    // A new style link can point at a sub-folder:
+    // `https://mega.nz/folder/<id>#<key>/folder/<sub-id>`. The key never
+    // contains a slash, so stopping there keeps the key valid (the whole
+    // folder is then downloaded).
+    let re = regex::Regex::new(r"#F!([^!]+)!([^!#\s/]+)")?;
+    let caps = re
+        .captures(&link)
+        .ok_or(anyhow!("lien de dossier invalide"))?;
     Ok((caps[1].to_string(), caps[2].to_string()))
 }
 
@@ -611,4 +694,107 @@ pub fn format_bytes(bytes: u64) -> String {
     let exp = exp.min(units.len() - 1);
     let val = bytes as f64 / (1u64 << (10 * exp)) as f64;
     format!("{:.2} {}", val, units[exp])
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{decrypt_node_key, extract_folder_id_and_key};
+    use crate::crypto::{
+        aes_ecb_encrypt, encrypt_mega_attr, node_aes_key, url_base64_encode,
+    };
+    use serde_json::json;
+
+    fn node_key(seed: u8) -> Vec<u8> {
+        (0..32u8)
+            .map(|i| i.wrapping_mul(11).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn node_key_is_decrypted_with_the_folder_key() {
+        let folder_key: Vec<u8> = (0..16u8).collect();
+        let key = node_key(5);
+        let wrapped = aes_ecb_encrypt(&key, &folder_key).unwrap();
+        let attributes =
+            encrypt_mega_attr(r#"{"n":"Module 1 - Creer sa boutique"}"#, &node_aes_key(&key))
+                .unwrap();
+
+        let entry = json!({
+            "h": "HANDLE1",
+            "k": format!("HANDLE1:{}", url_base64_encode(&wrapped)),
+            "a": url_base64_encode(&attributes),
+        });
+
+        let (decoded, name) = decrypt_node_key(&entry, &folder_key).expect("node key");
+        assert_eq!(decoded, url_base64_encode(&key));
+        assert_eq!(name.as_deref(), Some("Module 1 - Creer sa boutique"));
+    }
+
+    #[test]
+    fn multi_segment_keys_fall_back_to_the_valid_one() {
+        let folder_key: Vec<u8> = (0..16u8).collect();
+        let valid = node_key(7);
+        let other = node_key(99);
+
+        let wrapped_other = aes_ecb_encrypt(&other, &folder_key).unwrap();
+        let wrapped_valid = aes_ecb_encrypt(&valid, &folder_key).unwrap();
+        let attributes = encrypt_mega_attr(r#"{"n":"Module 2"}"#, &node_aes_key(&valid)).unwrap();
+
+        let entry = json!({
+            "h": "HANDLE2",
+            "k": format!(
+                "H1:{}/H2:{}",
+                url_base64_encode(&wrapped_other),
+                url_base64_encode(&wrapped_valid)
+            ),
+            "a": url_base64_encode(&attributes),
+        });
+
+        let (decoded, name) = decrypt_node_key(&entry, &folder_key).expect("node key");
+        assert_eq!(decoded, url_base64_encode(&valid));
+        assert_eq!(name.as_deref(), Some("Module 2"));
+    }
+
+    #[test]
+    fn node_without_attributes_keeps_its_key() {
+        let folder_key = [3u8; 16];
+        let key = node_key(9);
+        let wrapped = aes_ecb_encrypt(&key, &folder_key).unwrap();
+
+        let entry = json!({
+            "h": "HANDLE3",
+            "k": format!("HANDLE3:{}", url_base64_encode(&wrapped)),
+        });
+
+        let (decoded, name) = decrypt_node_key(&entry, &folder_key).expect("node key");
+        assert_eq!(decoded, url_base64_encode(&key));
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn node_without_key_is_ignored() {
+        let entry = json!({ "h": "HANDLE4", "a": "AAAA" });
+        assert!(decrypt_node_key(&entry, &[0u8; 16]).is_none());
+    }
+
+    #[test]
+    fn folder_links_are_parsed() {
+        let (id, key) =
+            extract_folder_id_and_key("https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw")
+                .unwrap();
+        assert_eq!(id, "2wkxkQAB");
+        assert_eq!(key, "IbHZz1kP9KvTp9uTJ2iOLw");
+
+        // Sub-folder link: keep the folder key and ignore the selection.
+        let (id, key) = extract_folder_id_and_key(
+            "https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw/folder/AbCdEfGh",
+        )
+        .unwrap();
+        assert_eq!(id, "2wkxkQAB");
+        assert_eq!(key, "IbHZz1kP9KvTp9uTJ2iOLw");
+    }
 }
