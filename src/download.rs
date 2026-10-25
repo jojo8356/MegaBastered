@@ -5,7 +5,7 @@ use reqwest::Client;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
@@ -389,10 +389,10 @@ impl Shared {
     }
 
     fn failed(&self) -> bool {
-        self.failure
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(true)
+        match self.failure.lock() {
+            Ok(slot) => slot.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
     }
 
     fn remaining(&self) -> Vec<usize> {
@@ -552,6 +552,14 @@ async fn download_file(
     // A round runs every remaining chunk once. If MEGA's quota interrupts it we
     // either wait (when asked to) or stop, keeping what is already on disk.
     loop {
+        // Refill the queue with whatever is still missing (a quota hit in the
+        // previous round leaves the chunk it was fetching out of the queue).
+        {
+            let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.clear();
+            queue.extend(shared.remaining());
+        }
+
         run_workers(client, source, file_size, &aes_key, &aes_iv, workers, &shared).await;
 
         if shared.remaining().is_empty() {
@@ -587,11 +595,10 @@ async fn download_file(
                 }
             }
         } else if shared.failed() {
-            let reason = shared
-                .failure
-                .lock()
-                .map(|slot| slot.clone())
-                .unwrap_or_default();
+            let reason = match shared.failure.lock() {
+                Ok(slot) => slot.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
             close_handles(&shared).await;
             progress.abandon_with_message("interrompu");
             return Err(FileError::Other(
@@ -606,8 +613,6 @@ async fn download_file(
             ));
         }
 
-        let left = shared.remaining();
-        *shared.queue.lock().unwrap_or_else(|e| e.into_inner()) = left.into_iter().collect();
     }
 
     // --- Finalize -----------------------------------------------------------
@@ -1306,10 +1311,17 @@ mod tests {
             sanitize_file_name("Module 1 - Creer sa boutique"),
             "Module 1 - Creer sa boutique"
         );
-        assert_eq!(sanitize_file_name("a/b\\\\c:d*e?f\\"g<h>i|j"), "a_b_c_d_e_f_g_h_i_j");
+
+        // Every character Windows refuses in a file name becomes "_".
+        let dirty = format!("a/b{c}d:e*f?g", c = '\\');
+        let dirty = format!("{dirty}\"h<i>j|k");
+        assert_eq!(sanitize_file_name(&dirty), "a_b_c_d_e_f_g_h_i_j_k");
+
         assert_eq!(sanitize_file_name("   "), "sans_nom");
         assert_eq!(sanitize_file_name(".."), "sans_nom");
-        assert_eq!(sanitize_file_name("ligne\\nbrisee"), "ligne_brisee");
+
+        let newline = format!("ligne{}brisee", '\n');
+        assert_eq!(sanitize_file_name(&newline), "ligne_brisee");
     }
 
     #[test]
