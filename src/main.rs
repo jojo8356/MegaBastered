@@ -105,16 +105,10 @@ async fn menu_download_link(state: &mut AppState) {
     config.workers = workers;
 
     let sid = state.session.as_ref().and_then(|s| s.sid.as_deref());
-    if let Ok((used, total)) = api::get_free_quota(&state.client, sid).await {
-        println!(
-            "  Quota MEGA (cette IP): {} utilises{}",
-            api::format_bytes(used),
-            if total == 0 {
-                String::new()
-            } else {
-                format!(" sur {}", api::format_bytes(total))
-            }
-        );
+    if let Ok(info) = api::get_quota_info(&state.client, sid).await {
+        for line in describe_quota(&info) {
+            println!("  {}", line);
+        }
     }
     println!();
 
@@ -322,16 +316,17 @@ async fn menu_quota(state: &mut AppState) {
         }
     };
 
-    match api::get_quota(&state.client, session).await {
-        Ok((used, total)) => {
-            let pct = if total > 0 {
-                (used as f64 / total as f64 * 100.0) as u64
-            } else {
-                0
-            };
-            println!("  Utilise: {} / {} ({}%)", api::format_bytes(used), api::format_bytes(total), pct);
-            let free = total.saturating_sub(used);
-            println!("  Libre:   {}", api::format_bytes(free));
+    match api::get_quota_info(&state.client, session.sid.as_deref()).await {
+        Ok(info) => {
+            for line in describe_quota(&info) {
+                println!("  {}", line);
+            }
+            if info.storage_max > 0 {
+                println!(
+                    "  Stockage libre: {}",
+                    api::format_bytes(info.storage_max.saturating_sub(info.storage_used))
+                );
+            }
         }
         Err(e) => println!("  Erreur: {}", e),
     }
@@ -695,21 +690,95 @@ fn build_client(proxy: Option<&str>) -> Result<Client> {
     Ok(builder.build()?)
 }
 
-/// Print what MEGA still allows for this IP address.
-async fn print_quota(client: &Client) -> Result<()> {
-    match api::get_free_quota(client, None).await {
-        Ok((used, total)) => {
-            println!(
-                "  Quota de transfert pour cette IP: {} utilises sur {}",
-                api::format_bytes(used),
-                if total == 0 {
-                    "inconnu (MEGA ne publie pas la limite)".to_string()
-                } else {
-                    api::format_bytes(total)
-                }
-            );
-            if total > 0 && used >= total {
-                println!("  Quota epuise: attends 1 a 6 h, ou lance avec -q 60 pour attendre.");
+/// Print the quota MEGA reports (storage + transfer).
+fn describe_quota(info: &api::QuotaInfo) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if info.has_account_transfer() {
+        let percent = if info.transfer_max > 0 {
+            format!(
+                " ({:.1}%)",
+                info.transfer_used as f64 / info.transfer_max as f64 * 100.0
+            )
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "Transfert du compte: {} utilises / {}{}",
+            api::format_bytes(info.transfer_used),
+            if info.transfer_max > 0 {
+                api::format_bytes(info.transfer_max)
+            } else {
+                "limite inconnue".to_string()
+            },
+            percent
+        ));
+        if info.transfer_served > 0 {
+            lines.push(format!(
+                "  dont {} servis depuis tes liens",
+                api::format_bytes(info.transfer_served)
+            ));
+        }
+        if info.account_exhausted() {
+            lines.push("  Quota du compte epuise: attends le renouvellement mensuel.".to_string());
+        }
+    }
+
+    if !info.ip_buckets.is_empty() || info.ip_transfer_used() > 0 {
+        lines.push(format!(
+            "Transfert de cette IP (fenetre glissante de 6 h): {} telecharges sur les 6 dernieres heures",
+            api::format_bytes(info.ip_transfer_used())
+        ));
+        if let Some(age) = info.bucket_age {
+            lines.push(format!(
+                "  Fenetre horaire en cours depuis {} ({}/6)",
+                format_secs(age),
+                (age / 3600 + 1).min(6)
+            ));
+        }
+        lines.push(
+            "  MEGA ne publie pas la limite gratuite (~5 Go, variable selon pays et charge)."
+                .to_string(),
+        );
+    }
+
+    if info.storage_max > 0 || info.storage_used > 0 {
+        lines.push(format!(
+            "Stockage: {} / {}",
+            api::format_bytes(info.storage_used),
+            if info.storage_max > 0 {
+                api::format_bytes(info.storage_max)
+            } else {
+                "illimite/inconnu".to_string()
+            }
+        ));
+    }
+
+    if info.transfer_reserved > 0 {
+        lines.push(format!(
+            "Reserve par des telechargements en cours: {}",
+            api::format_bytes(info.transfer_reserved)
+        ));
+    }
+
+    lines
+}
+
+fn format_secs(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+async fn print_quota(client: &Client, sid: Option<&str>) -> Result<()> {
+    match api::get_quota_info(client, sid).await {
+        Ok(info) => {
+            for line in describe_quota(&info) {
+                println!("  {}", line);
             }
         }
         Err(e) => println!("  Quota indisponible: {}", e),
@@ -726,7 +795,7 @@ async fn run_cli(args: CliArgs) -> Result<()> {
     let client = build_client(args.proxy.as_deref())?;
 
     if args.quota_only {
-        print_quota(&client).await?;
+        print_quota(&client, None).await?;
         return Ok(());
     }
 
@@ -807,7 +876,7 @@ async fn run_cli(args: CliArgs) -> Result<()> {
         quota_wait: args.quota_wait,
     };
 
-    print_quota(&client).await?;
+    print_quota(&client, None).await?;
 
     if api::is_folder_link(&args.link) {
         println!("Dossier: {}", args.link);

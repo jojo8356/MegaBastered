@@ -371,42 +371,118 @@ pub async fn get_file_metadata(client: &Client, link: &str, sid: Option<&str>) -
     Ok((fname, fsize, file_key))
 }
 
-// --- Free transfer quota left for this IP address ---
+// --- Quota (storage + transfer) ---
 
-/// Ask MEGA how much transfer quota is left for this IP address (`a:"uq"`).
+/// Everything MEGA reports about quotas (`a:"uq"`).
 ///
-/// Works without an account: this is the quota MEGA applies to the IP that
-/// asks, which is exactly the one that triggers HTTP 509.
-pub async fn get_free_quota(client: &Client, sid: Option<&str>) -> Result<(u64, u64)> {
-    let request = r#"[{"a":"uq","xfer":1,"strg":1}]"#;
+/// MEGA keeps two independent counters:
+/// - **storage**: bytes stored in the account (`cstrg` / `mstrg`);
+/// - **transfer**: bytes downloaded/streamed, either as an account monthly
+///   allowance for paid plans (`mxfer`, `caxfer`, `csxfer`) or as the free
+///   *per-IP* rolling window (`tah`: 6 hourly buckets, `bt`: their age).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuotaInfo {
+    /// Storage used / allowed (0 when unknown).
+    pub storage_used: u64,
+    pub storage_max: u64,
+    /// Account transfer allowance (`mxfer`) and what was used (`caxfer`+`tuo`).
+    pub transfer_max: u64,
+    pub transfer_used: u64,
+    /// Bytes served from this account's links (`csxfer` / `tua`).
+    pub transfer_served: u64,
+    /// Bytes currently reserved by running downloads (`tar`).
+    pub transfer_reserved: u64,
+    /// Free, IP based quota: six hourly buckets (`tah`).
+    pub ip_buckets: Vec<u64>,
+    /// Age in seconds of the current bucket window (`bt`).
+    pub bucket_age: Option<u64>,
+}
+
+impl QuotaInfo {
+    /// Bytes downloaded from this IP during the rolling six hour window.
+    pub fn ip_transfer_used(&self) -> u64 {
+        self.ip_buckets.iter().sum()
+    }
+
+    /// True when MEGA reports a paid/account transfer allowance.
+    pub fn has_account_transfer(&self) -> bool {
+        self.transfer_max > 0 || self.transfer_used > 0
+    }
+
+    /// True when the account allowance is spent.
+    pub fn account_exhausted(&self) -> bool {
+        self.transfer_max > 0 && self.transfer_used >= self.transfer_max
+    }
+}
+
+/// Read a number that MEGA may send as a plain value or inside an array.
+fn json_number(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return Some(number);
+    }
+    value
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(|first| first.as_u64())
+}
+
+fn field(object: &Value, names: &[&str]) -> u64 {
+    for name in names {
+        if let Some(number) = json_number(&object[*name]) {
+            return number;
+        }
+    }
+    0
+}
+
+/// Parse an `a:"uq"` response.
+fn parse_quota(object: &Value) -> QuotaInfo {
+    let ip_buckets = object["tah"]
+        .as_array()
+        .map(|values| values.iter().filter_map(|value| value.as_u64()).collect())
+        .unwrap_or_default();
+
+    let mut info = QuotaInfo {
+        storage_used: field(object, &["cstrg"]),
+        storage_max: field(object, &["mstrg"]),
+        transfer_max: field(object, &["mxfer"]),
+        transfer_used: field(object, &["caxfer", "tuo"]),
+        transfer_served: field(object, &["csxfer", "tua"]),
+        transfer_reserved: field(object, &["tar"]),
+        ip_buckets,
+        bucket_age: object["bt"].as_u64(),
+    };
+
+    // Anonymous folder links answer per node (`cstrgn`, `mxfern`, ...).
+    if info.storage_used == 0 {
+        info.storage_used = field(object, &["cstrgn"]);
+    }
+    if info.storage_max == 0 {
+        info.storage_max = field(object, &["mstrgn"]);
+    }
+    if info.transfer_max == 0 {
+        info.transfer_max = field(object, &["mxfern"]);
+    }
+    if info.transfer_used == 0 {
+        info.transfer_used = field(object, &["caxfern"]);
+    }
+
+    info
+}
+
+/// Ask MEGA for the storage and transfer quotas (`a:"uq"`, `v:2`).
+pub async fn get_quota_info(client: &Client, sid: Option<&str>) -> Result<QuotaInfo> {
+    let request = r#"[{"a":"uq","xfer":1,"strg":1,"v":2}]"#;
     let res = raw_api_request(client, request, sid).await?;
     let object = res.get(0).cloned().unwrap_or(Value::Null);
-
-    let used = object["cstrgn"]
-        .as_array()
-        .and_then(|values| values.first())
-        .and_then(|value| value.as_u64())
-        .or_else(|| object["cstrg"].as_u64())
-        .unwrap_or(0);
-
-    let total = object["mstrgn"]
-        .as_array()
-        .and_then(|values| values.first())
-        .and_then(|value| value.as_u64())
-        .or_else(|| object["mstrg"].as_u64())
-        .unwrap_or(0);
-
-    Ok((used, total))
+    Ok(parse_quota(&object))
 }
 
 // --- Get quota ---
 
 pub async fn get_quota(client: &Client, session: &MegaSession) -> Result<(u64, u64)> {
-    let request = r#"[{"a":"uq","xfer":1,"strg":1}]"#;
-    let res = raw_api_request(client, request, session.sid.as_deref()).await?;
-    let used = res[0]["cstrg"].as_u64().unwrap_or(0);
-    let total = res[0]["mstrg"].as_u64().unwrap_or(0);
-    Ok((used, total))
+    let info = get_quota_info(client, session.sid.as_deref()).await?;
+    Ok((info.storage_used, info.storage_max))
 }
 
 // --- Init upload ---
@@ -824,5 +900,69 @@ mod tests {
         .unwrap();
         assert_eq!(id, "2wkxkQAB");
         assert_eq!(key, "IbHZz1kP9KvTp9uTJ2iOLw");
+    }
+
+    #[test]
+    fn free_ip_quota_is_parsed_from_hourly_buckets() {
+        let payload = serde_json::json!({
+            "bt": 7200,
+            "tah": [1_000_000_000u64, 2_000_000_000u64, 500_000_000u64, -1, -1, -1],
+            "tar": 12_345,
+            "cstrg": 3_000_000_000u64,
+            "mstrg": 21_474_836_480u64,
+            "rtt": 0,
+            "s": 3600
+        });
+
+        let info = parse_quota(&payload);
+        assert_eq!(info.ip_buckets.len(), 6);
+        assert_eq!(info.ip_transfer_used(), 3_500_000_000);
+        assert_eq!(info.bucket_age, Some(7200));
+        assert_eq!(info.transfer_reserved, 12_345);
+        assert_eq!(info.storage_used, 3_000_000_000);
+        assert_eq!(info.storage_max, 21_474_836_480);
+        assert!(!info.has_account_transfer());
+    }
+
+    #[test]
+    fn paid_transfer_allowance_is_parsed() {
+        let payload = serde_json::json!({
+            "mxfer": 1_099_511_627_776u64,
+            "caxfer": 250_000_000_000u64,
+            "tuo": 5_000_000_000u64,
+            "csxfer": 1_000_000_000u64,
+            "tua": 2_000_000_000u64,
+            "cstrg": 900_000_000_000u64,
+            "mstrg": 2_199_023_255_552u64,
+            "tah": [-1, -1, -1, -1, -1, -1]
+        });
+
+        let info = parse_quota(&payload);
+        assert!(info.has_account_transfer());
+        assert_eq!(info.transfer_max, 1_099_511_627_776);
+        assert_eq!(info.transfer_used, 255_000_000_000);
+        assert_eq!(info.transfer_served, 3_000_000_000);
+        assert_eq!(info.ip_transfer_used(), 0);
+        assert!(!info.account_exhausted());
+    }
+
+    #[test]
+    fn anonymous_per_node_quota_is_parsed() {
+        let payload = serde_json::json!({
+            "cstrgn": [7_000_000u64, 3_000_000u64],
+            "mstrgn": [10_000_000u64, 10_000_000u64]
+        });
+
+        let info = parse_quota(&payload);
+        assert_eq!(info.storage_used, 7_000_000);
+        assert_eq!(info.storage_max, 10_000_000);
+    }
+
+    #[test]
+    fn empty_quota_payload_is_harmless() {
+        let info = parse_quota(&serde_json::json!({}));
+        assert_eq!(info, QuotaInfo::default());
+        assert!(!info.has_account_transfer());
+        assert!(!info.account_exhausted());
     }
 }
