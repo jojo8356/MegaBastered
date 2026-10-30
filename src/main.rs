@@ -8,6 +8,7 @@ use anyhow::Result;
 use console::Style;
 use dialoguer::{Input, Select};
 use reqwest::Client;
+use std::collections::BTreeMap;
 
 use api::MegaSession;
 
@@ -100,7 +101,7 @@ async fn menu_download_link(state: &mut AppState) {
     let title = Style::new().bold().cyan();
     println!("{}", title.apply_to("-- Telecharger (lien public) --\n"));
 
-    let link = ask("Lien MEGA (ou 'q' pour annuler)");
+    let link = ask("Lien MEGA (dossier entier ou sous-dossier/partie, ou 'q' pour annuler)");
     if link.is_empty() || link == "q" {
         return;
     }
@@ -119,7 +120,14 @@ async fn menu_download_link(state: &mut AppState) {
     let folder = api::is_folder_link(&link);
 
     if folder {
-        println!("\n  Dossier public detecte - arborescence complete");
+        let selected = api::extract_folder_link_details(&link)
+            .ok()
+            .and_then(|(_, _, selected)| selected);
+        if let Some(handle) = selected {
+            println!("\n  Sous-dossier selectionne detecte ({})", handle);
+        } else {
+            println!("\n  Dossier public detecte - contenu complet");
+        }
     }
     println!("  Destination: {}", path);
     println!("  Connexions:  {}", workers);
@@ -661,6 +669,8 @@ struct CliArgs {
     speed_limit: u64,
     quota_wait: std::time::Duration,
     list: bool,
+    tree: bool,
+    folder_path: Option<String>,
     /// Print the remaining transfer quota for this IP and exit.
     quota_only: bool,
     /// Optional HTTP/SOCKS5 proxy for every MEGA request (e.g. a VPN endpoint).
@@ -683,7 +693,8 @@ fn print_cli_help() {
 Usage:\n  \
   megacli                          menu interactif\n  \
   megacli <lien> [options]         telechargement direct (fichier ou dossier)\n  \
-  megacli --list <lien>            affiche l'arborescence sans rien telecharger\n  \
+  megacli --list <lien>            affiche les fichiers et leur etat\n  \
+  megacli --tree <lien>            affiche l'arborescence des dossiers\n  \
   megacli --proxy-file p.txt --proxy-check   teste une liste de proxies\n\n\
 Options:\n  \
   -d, --dest <dir>        dossier de destination (defaut: dossier Telechargements)\n  \
@@ -691,7 +702,9 @@ Options:\n  \
   -s, --speed <KiB/s>     limite de vitesse, 0 = illimite (defaut: 0)\n  \
   -q, --quota-wait <min>  en cas de quota MEGA (HTTP 509), attendre N minutes\n                          \
 puis reprendre au lieu de s'arreter (defaut: 0)\n  \
-  -l, --list              lister le contenu du dossier\n  \
+  -l, --list              lister les fichiers et leur etat local\n  \
+      --tree              afficher l'arborescence des dossiers/fichiers\n  \
+      --folder <chemin>   ne telecharger que ce dossier (chemin MEGA)\n  \
       --quota             afficher le quota de transfert restant pour cette IP\n  \
       --proxy <url>       proxy HTTP/SOCKS5 pour toutes les requetes\n  \
                           (ex: socks5h://127.0.0.1:9050)\n  \
@@ -722,6 +735,8 @@ fn parse_cli() -> Option<CliArgs> {
     let mut speed_limit = 0u64;
     let mut quota_wait_min = 0u64;
     let mut list = false;
+    let mut tree = false;
+    let mut folder_path: Option<String> = None;
     let mut proxy: Option<String> = None;
     let mut proxy_file: Option<String> = None;
     let mut proxy_check = false;
@@ -740,6 +755,17 @@ fn parse_cli() -> Option<CliArgs> {
                 std::process::exit(0);
             }
             "-l" | "--list" => list = true,
+            "--tree" => tree = true,
+            "--folder" => {
+                index += 1;
+                match args.get(index).filter(|value| !value.starts_with('-')) {
+                    Some(path) => folder_path = Some(path.clone()),
+                    None => {
+                        eprintln!("--folder requiert un chemin de dossier");
+                        std::process::exit(1);
+                    }
+                }
+            }
             "--quota" => quota_only = true,
             "--proxy" => {
                 index += 1;
@@ -839,6 +865,8 @@ fn parse_cli() -> Option<CliArgs> {
         speed_limit,
         quota_wait: std::time::Duration::from_secs(quota_wait_min * 60),
         list,
+        tree,
+        folder_path,
         quota_only,
         proxy,
         proxy_file,
@@ -1264,14 +1292,32 @@ async fn run_cli(args: CliArgs) -> Result<()> {
 
     print_quota(&client, None).await?;
 
+    if args.tree {
+        return print_tree(&client, &args.link).await;
+    }
     if args.list {
         return print_list(&client, &args).await;
     }
 
     if api::is_folder_link(&args.link) {
         println!("Dossier: {}", args.link);
+        if let Some(path) = args.folder_path.as_deref() {
+            println!("Partie selectionnee: {}", path);
+        }
         println!("Destination: {}", args.dest);
-        let report = download::download_folder(&client, &args.link, &args.dest, config).await?;
+        let report = match args.folder_path.as_deref() {
+            Some(path) => {
+                download::download_folder_by_path(
+                    &client,
+                    &args.link,
+                    path,
+                    &args.dest,
+                    config,
+                )
+                .await?
+            }
+            None => download::download_folder(&client, &args.link, &args.dest, config).await?,
+        };
         if report.quota_exhausted {
             advise_other_exit(&proxies, index);
             std::process::exit(2);
@@ -1280,6 +1326,9 @@ async fn run_cli(args: CliArgs) -> Result<()> {
             std::process::exit(1);
         }
     } else {
+        if args.folder_path.is_some() {
+            return Err(anyhow::anyhow!("--folder ne s'utilise qu'avec un lien MEGA de dossier"));
+        }
         println!("Fichier: {}", args.link);
         match download::download_from_link(&client, &args.link, &args.dest, config).await {
             Ok(()) => {}
@@ -1308,6 +1357,75 @@ fn advise_other_exit(proxies: &[proxy::ProxyEntry], index: usize) {
         );
     } else if proxies.is_empty() {
         println!("  Relancer plus tard (fenetre glissante de 6 h), ou avec un proxy/VPN.");
+    }
+}
+
+#[derive(Default)]
+struct TreeItem {
+    is_dir: bool,
+    size: Option<u64>,
+    children: BTreeMap<String, TreeItem>,
+}
+
+async fn print_tree(client: &Client, link: &str) -> Result<()> {
+    let entries = download::list_folder(client, link).await?;
+    let mut root = TreeItem::default();
+
+    for entry in &entries {
+        let components: Vec<String> = entry
+            .path
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let mut current = &mut root;
+        for (index, component) in components.iter().enumerate() {
+            let item = current.children.entry(component.clone()).or_default();
+            if index + 1 == components.len() {
+                item.is_dir = entry.is_dir;
+                item.size = (!entry.is_dir).then_some(entry.size);
+            } else {
+                item.is_dir = true;
+            }
+            current = item;
+        }
+    }
+
+    println!("Arborescence MEGA:");
+    if root.children.is_empty() {
+        println!("  (dossier vide)");
+    } else {
+        print_tree_items(&root.children, "");
+    }
+    Ok(())
+}
+
+fn print_tree_items(items: &BTreeMap<String, TreeItem>, prefix: &str) {
+    let mut ordered: Vec<_> = items.iter().collect();
+    ordered.sort_by(|(name_a, item_a), (name_b, item_b)| {
+        item_b
+            .is_dir
+            .cmp(&item_a.is_dir)
+            .then_with(|| name_a.to_lowercase().cmp(&name_b.to_lowercase()))
+    });
+
+    for (index, (name, item)) in ordered.iter().enumerate() {
+        let last = index + 1 == ordered.len();
+        let branch = if last { "└── " } else { "├── " };
+        if item.is_dir {
+            println!("{}{}{}/", prefix, branch, name);
+        } else {
+            println!(
+                "{}{}{} ({})",
+                prefix,
+                branch,
+                name,
+                api::format_bytes(item.size.unwrap_or(0))
+            );
+        }
+        if !item.children.is_empty() {
+            let child_prefix = format!("{}{}", prefix, if last { "    " } else { "│   " });
+            print_tree_items(&item.children, &child_prefix);
+        }
     }
 }
 

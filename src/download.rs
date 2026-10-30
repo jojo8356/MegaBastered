@@ -131,13 +131,13 @@ pub struct FolderReport {
 
 /// List a public folder without downloading anything.
 pub async fn list_folder(client: &Client, link: &str) -> Result<Vec<FolderEntry>> {
-    let (folder_id, folder_key) = api::extract_folder_id_and_key(link)?;
+    let (folder_id, folder_key, selected_folder) = api::extract_folder_link_details(link)?;
     let nodes = api::get_folder_nodes(client, &folder_id, &folder_key).await?;
-    let paths = resolve_paths(&nodes, &folder_id);
+    let paths = scoped_paths(&nodes, &folder_id, selected_folder.as_deref())?;
 
     let mut entries: Vec<FolderEntry> = nodes
         .iter()
-        .filter(|node| node.handle != folder_id)
+        .filter(|node| paths.contains_key(&node.handle))
         .map(|node| FolderEntry {
             path: paths
                 .get(&node.handle)
@@ -159,7 +159,29 @@ pub async fn download_folder(
     dest_dir: &str,
     config: DownloadConfig,
 ) -> Result<FolderReport> {
-    let (folder_id, folder_key) = api::extract_folder_id_and_key(link)?;
+    download_folder_inner(client, link, None, dest_dir, config).await
+}
+
+/// Download only the folder identified by its visible path inside the shared
+/// folder. The path may include the shared root's name as its first component.
+pub async fn download_folder_by_path(
+    client: &Client,
+    link: &str,
+    folder_path: &str,
+    dest_dir: &str,
+    config: DownloadConfig,
+) -> Result<FolderReport> {
+    download_folder_inner(client, link, Some(folder_path), dest_dir, config).await
+}
+
+async fn download_folder_inner(
+    client: &Client,
+    link: &str,
+    folder_path: Option<&str>,
+    dest_dir: &str,
+    config: DownloadConfig,
+) -> Result<FolderReport> {
+    let (folder_id, folder_key, linked_selection) = api::extract_folder_link_details(link)?;
 
     println!("  Chargement du contenu du dossier...");
     let nodes = api::get_folder_nodes(client, &folder_id, &folder_key).await?;
@@ -170,13 +192,20 @@ pub async fn download_folder(
         ));
     }
 
-    let paths = resolve_paths(&nodes, &folder_id);
+    let selected_folder = match folder_path {
+        Some(path) => Some(resolve_folder_handle(&nodes, &folder_id, path)?),
+        None => linked_selection,
+    };
+    let paths = scoped_paths(&nodes, &folder_id, selected_folder.as_deref())?;
     let base = Path::new(dest_dir);
     tokio::fs::create_dir_all(base).await?;
 
     // Recreate every folder, including the empty ones.
     let mut directories = 0usize;
-    for node in nodes.iter().filter(|node| node.is_folder()) {
+    for node in nodes
+        .iter()
+        .filter(|node| node.is_folder() && paths.contains_key(&node.handle))
+    {
         if let Some(relative) = paths.get(&node.handle) {
             if tokio::fs::create_dir_all(base.join(relative)).await.is_ok() {
                 directories += 1;
@@ -187,7 +216,7 @@ pub async fn download_folder(
     // Files, with their destination path.
     let files: Vec<(&api::FileNode, PathBuf)> = nodes
         .iter()
-        .filter(|node| node.is_file())
+        .filter(|node| node.is_file() && paths.contains_key(&node.handle))
         .map(|node| {
             let relative = match paths.get(&node.handle) {
                 Some(path) => path.clone(),
@@ -1240,6 +1269,129 @@ fn resolve_paths(nodes: &[api::FileNode], folder_id: &str) -> HashMap<String, Pa
     paths
 }
 
+/// Resolve a human-readable folder path to the matching MEGA node handle.
+fn resolve_folder_handle(nodes: &[api::FileNode], folder_id: &str, folder_path: &str) -> Result<String> {
+    let requested: Vec<String> = folder_path
+        .split(|ch| ch == '/' || ch == '\\')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string())
+        .collect();
+    if requested.is_empty() {
+        return Err(anyhow!("le chemin indique par --folder est vide"));
+    }
+
+    let root_name = nodes
+        .iter()
+        .find(|node| node.handle == folder_id)
+        .map(|node| sanitize_file_name(&node.name));
+    let paths = resolve_paths(nodes, folder_id);
+    let mut matches = Vec::new();
+
+    for node in nodes.iter().filter(|node| node.is_folder()) {
+        let relative = match paths.get(&node.handle) {
+            Some(path) => path,
+            None => continue,
+        };
+        let relative_parts: Vec<String> = relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let exact_relative = relative_parts == requested;
+        let exact_with_root = root_name.as_ref().is_some_and(|root| {
+            std::iter::once(root.to_string())
+                .chain(relative_parts.iter().cloned())
+                .eq(requested.iter().cloned())
+        });
+        // The API may omit the shared-root node from its listing. In that
+        // case accept the visible breadcrumb root as the one extra first part.
+        let root_omitted_from_listing = requested.len() == relative_parts.len() + 1
+            && requested
+                .get(1..)
+                .is_some_and(|parts| parts == relative_parts.as_slice());
+        if exact_relative || exact_with_root || root_omitted_from_listing {
+            matches.push(node.handle.clone());
+        }
+    }
+
+    // Also accept the shared folder itself as a selection (`--folder <root>`).
+    if root_name
+        .as_ref()
+        .is_some_and(|root| requested.len() == 1 && requested[0].as_str() == root.as_str())
+    {
+        return Ok(folder_id.to_string());
+    }
+
+    match matches.as_slice() {
+        [handle] => Ok(handle.clone()),
+        [] => Err(anyhow!(
+            "dossier '{}' introuvable dans ce lien MEGA (utilise --tree pour voir les chemins)",
+            folder_path
+        )),
+        _ => Err(anyhow!(
+            "le chemin '{}' correspond a plusieurs dossiers; precise le chemin complet",
+            folder_path
+        )),
+    }
+}
+
+/// Restrict a shared-folder listing to a selected sub-folder, if the link
+/// contains one, and make its contents relative to that folder.
+fn scoped_paths(
+    nodes: &[api::FileNode],
+    folder_id: &str,
+    selected_folder: Option<&str>,
+) -> Result<HashMap<String, PathBuf>> {
+    let paths = resolve_paths(nodes, folder_id);
+    let Some(selected) = selected_folder else {
+        return Ok(paths);
+    };
+    if selected == folder_id {
+        return Ok(paths);
+    }
+
+    let selected_node = nodes
+        .iter()
+        .find(|node| node.handle == selected && node.is_folder())
+        .ok_or_else(|| anyhow!("le sous-dossier selectionne ({}) est introuvable", selected))?;
+    let selected_path = paths
+        .get(&selected_node.handle)
+        .ok_or_else(|| anyhow!("chemin du sous-dossier selectionne introuvable"))?;
+    let by_handle: HashMap<&str, &api::FileNode> =
+        nodes.iter().map(|node| (node.handle.as_str(), node)).collect();
+    let mut scoped = HashMap::new();
+
+    for node in nodes.iter().filter(|node| node.handle != selected) {
+        let mut parent = node.parent.as_str();
+        let mut is_descendant = false;
+        let mut guard = 0usize;
+        while !parent.is_empty() && parent != folder_id {
+            if parent == selected {
+                is_descendant = true;
+                break;
+            }
+            let Some(parent_node) = by_handle.get(parent) else {
+                break;
+            };
+            parent = parent_node.parent.as_str();
+            guard += 1;
+            if guard > 512 {
+                break;
+            }
+        }
+
+        if is_descendant {
+            if let Some(path) = paths.get(&node.handle) {
+                if let Ok(relative) = path.strip_prefix(selected_path) {
+                    scoped.insert(node.handle.clone(), relative.to_path_buf());
+                }
+            }
+        }
+    }
+
+    Ok(scoped)
+}
+
 /// Make a MEGA node name safe to use as a single path component.
 pub fn sanitize_file_name(name: &str) -> String {
     let cleaned: String = name
@@ -1358,6 +1510,74 @@ mod tests {
             name: name.to_string(),
             key: String::new(),
         }
+    }
+
+    #[test]
+    fn selected_subfolder_includes_only_its_contents_and_uses_relative_paths() {
+        let nodes = vec![
+            node("root", "", 2, "root"),
+            node("selected", "root", 1, "Partie 1"),
+            node("direct-file", "selected", 0, "intro.mp4"),
+            node("nested", "selected", 1, "Lecon 1"),
+            node("nested-file", "nested", 0, "video.mp4"),
+            node("other", "root", 1, "Partie 2"),
+            node("other-file", "other", 0, "hors-sujet.mp4"),
+        ];
+
+        let paths = scoped_paths(&nodes, "root", Some("selected")).unwrap();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths["direct-file"], PathBuf::from("intro.mp4"));
+        assert_eq!(paths["nested"], PathBuf::from("Lecon 1"));
+        assert_eq!(paths["nested-file"], PathBuf::from("Lecon 1/video.mp4"));
+        assert!(!paths.contains_key("selected"));
+        assert!(!paths.contains_key("other-file"));
+    }
+
+    #[test]
+    fn folder_path_resolves_with_or_without_shared_root_name() {
+        let nodes = vec![
+            node("root", "", 2, "Web2fou - Toutes les formations"),
+            node("part", "root", 1, "Copywriting - Les secrets des pages de ventes extrêmement rentables"),
+        ];
+        assert_eq!(
+            resolve_folder_handle(
+                &nodes,
+                "root",
+                "/Web2fou - Toutes les formations/Copywriting - Les secrets des pages de ventes extrêmement rentables",
+            )
+            .unwrap(),
+            "part"
+        );
+        assert_eq!(
+            resolve_folder_handle(&nodes, "root", "Copywriting - Les secrets des pages de ventes extrêmement rentables")
+                .unwrap(),
+            "part"
+        );
+
+        // Some public-folder listings omit the shared root node itself.
+        let nodes_without_root = vec![node(
+            "part",
+            "root",
+            1,
+            "Copywriting - Les secrets des pages de ventes extrêmement rentables",
+        )];
+        assert_eq!(
+            resolve_folder_handle(
+                &nodes_without_root,
+                "root",
+                "/Web2fou - Toutes les formations/Copywriting - Les secrets des pages de ventes extrêmement rentables",
+            )
+            .unwrap(),
+            "part"
+        );
+    }
+
+    #[test]
+    fn selected_subfolder_must_exist_and_be_a_folder() {
+        let nodes = vec![node("file", "root", 0, "video.mp4")];
+        assert!(scoped_paths(&nodes, "root", Some("missing")).is_err());
+        assert!(scoped_paths(&nodes, "root", Some("file")).is_err());
+        assert!(resolve_folder_handle(&nodes, "root", "bad/path").is_err());
     }
 
     #[test]
