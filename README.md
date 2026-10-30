@@ -11,7 +11,8 @@ No Java, no Electron, no bloat. Just a single binary that handles downloads, upl
 - **Streaming** - Decrypt and pipe media files to mpv, vlc, or ffplay
 - **Account management** - Login with email/password, 2FA support, session handling
 - **Cloud file browser** - List files in tree view with handles for easy reference
-- **Folder downloads** - Download a whole public folder (or sub-folder): tree is recreated, every file is decrypted with its own node key, already downloaded files are skipped
+- **Folder downloads** - Download a whole public folder or target one part by its MEGA path (`--folder`): tree is recreated, each file is decrypted with its own node key, and existing downloads are skipped
+- **Public folder tree** - Inspect the folder/file architecture with `--tree` before choosing what to download
 - **Resumable transfers** - Per-chunk index (`.megacli.parts`): an interrupted download resumes exactly where it stopped, and a partial file is never reported as complete
 - **Quota aware** - asks MEGA how much transfer quota is left for your IP (`--quota`), stops cleanly on HTTP 509 and can wait/resume on its own (`--quota-wait`)
 - **Proxy support** - route every MEGA request through your own HTTP/SOCKS5 proxy or VPN endpoint (`--proxy`), or feed a whole `proxies.txt` list with `--proxy-file`
@@ -78,6 +79,15 @@ megacli --list "https://mega.nz/folder/<id>#<key>" -d ~/Documents/Formations
 
 # Download everything (resumes on the next run)
 megacli "https://mega.nz/folder/<id>#<key>" -d ~/Documents/Formations -w 8
+
+# See the folders and files before downloading
+megacli --tree "https://mega.nz/folder/<id>#<key>"
+
+# Download only one folder by its visible path in the MEGA tree
+megacli "https://mega.nz/folder/<id>#<key>" --folder "/Web2fou - Toutes les formations/Copywriting - Les secrets des pages de ventes extrêmement rentables" -d ~/Documents/Copywriting -w 8
+
+# A MEGA URL already pointing at a sub-folder still works too
+megacli "https://mega.nz/folder/<id>#<key>/folder/<sub-folder-id>" -d ~/Documents/Partie1 -w 8
 
 # Same, but wait 30 min and continue automatically when MEGA's quota hits
 megacli "https://mega.nz/folder/<id>#<key>" -d ~/Documents/Formations -q 30
@@ -259,7 +269,11 @@ Two practical details that save quota:
 Paste any `mega.nz` link (file or folder). Supports both old (`#!`, `#F!`) and new
 (`/file/`, `/folder/`) URL formats.
 
-Folder links (`https://mega.nz/folder/<id>#<key>`) are fully supported:
+Folder links (`https://mega.nz/folder/<id>#<key>`) are fully supported. If MEGA gives you a
+selected sub-folder link such as
+`https://mega.nz/folder/<id>#<key>/folder/<sub-folder-id>`, only that part and its
+contents are listed or downloaded; the enclosing course is not downloaded. The
+files are saved relative to the selected sub-folder.
 
 1. the folder tree is fetched once (`a:f` with the folder key),
 2. every node key is unwrapped with the folder key and used to decrypt its name,

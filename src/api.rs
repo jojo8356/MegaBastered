@@ -819,28 +819,50 @@ pub fn extract_n_folder_id(link: &str) -> Result<String> {
     Ok(caps[1].to_string())
 }
 
-pub fn extract_folder_id_and_key(link: &str) -> Result<(String, String)> {
-    let link = normalize_mega_link(link);
-    // A new style link can point at a sub-folder:
-    // `https://mega.nz/folder/<id>#<key>/folder/<sub-id>`. The key never
-    // contains a slash, so stopping there keeps the key valid (the whole
-    // folder is then downloaded).
-    let re = regex::Regex::new(r"#F!([^!]+)!([^!#\s/]+)")?;
-    let caps = re
-        .captures(&link)
-        .ok_or_else(|| anyhow!("lien de dossier invalide: {}", clean_link_input(&link)))?;
+/// Extract the shared-folder credentials and, when the URL selects one, the
+/// selected sub-folder handle. MEGA's `/folder/<handle>` suffix is a UI
+/// selection and must be applied locally after fetching the shared tree.
+pub fn extract_folder_link_details(link: &str) -> Result<(String, String, Option<String>)> {
+    let cleaned = clean_link_input(link);
 
-    let folder_id = caps[1].to_string();
-    let folder_key = caps[2].to_string();
-
-    // A valid folder key is base64 (URL-safe, usually unpadded).
-    if url_base64_decode(&folder_key).is_err() {
-        return Err(anyhow!(
-            "cle de dossier illisible ({}). Verifie que le lien est complet et sans texte colle autour.",
-            clean_link_input(&link)
-        ));
+    // Modern link with a selected sub-folder:
+    // `https://mega.nz/folder/<root>#<key>/folder/<selected>`.
+    let modern = regex::Regex::new(
+        r"(?i)mega\.(?:nz|co\.nz)/folder/([^#/?]+)#([^/\s?#]+)(?:/folder/([^/\s?#]+))?",
+    )?;
+    if let Some(caps) = modern.captures(&cleaned) {
+        let folder_id = caps[1].to_string();
+        let folder_key = caps[2].to_string();
+        let selected_folder = caps.get(3).map(|m| m.as_str().to_string());
+        validate_folder_key(&folder_key, &cleaned)?;
+        return Ok((folder_id, folder_key, selected_folder));
     }
 
+    // Legacy links don't carry a selected-folder suffix.
+    let normalized = normalize_mega_link(&cleaned);
+    let re = regex::Regex::new(r"#F!([^!]+)!([^!#\s/]+)")?;
+    let caps = re
+        .captures(&normalized)
+        .ok_or_else(|| anyhow!("lien de dossier invalide: {}", cleaned))?;
+    let folder_id = caps[1].to_string();
+    let folder_key = caps[2].to_string();
+    validate_folder_key(&folder_key, &cleaned)?;
+    Ok((folder_id, folder_key, None))
+}
+
+fn validate_folder_key(folder_key: &str, link: &str) -> Result<()> {
+    if url_base64_decode(folder_key).is_err() {
+        return Err(anyhow!(
+            "cle de dossier illisible ({}). Verifie que le lien est complet et sans texte colle autour.",
+            link
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn extract_folder_id_and_key(link: &str) -> Result<(String, String)> {
+    let (folder_id, folder_key, _) = extract_folder_link_details(link)?;
     Ok((folder_id, folder_key))
 }
 
@@ -871,7 +893,10 @@ pub fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt_node_key, extract_folder_id_and_key, parse_quota, QuotaInfo};
+    use super::{
+        decrypt_node_key, extract_folder_id_and_key, extract_folder_link_details, parse_quota,
+        QuotaInfo,
+    };
     use crate::crypto::{
         aes_ecb_encrypt, encrypt_mega_attr, node_aes_key, url_base64_encode,
     };
@@ -965,6 +990,20 @@ mod tests {
         .unwrap();
         assert_eq!(id, "2wkxkQAB");
         assert_eq!(key, "IbHZz1kP9KvTp9uTJ2iOLw");
+
+        let (id, key, selected) = extract_folder_link_details(
+            "https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw/folder/Ox9G2RoJ",
+        )
+        .unwrap();
+        assert_eq!(id, "2wkxkQAB");
+        assert_eq!(key, "IbHZz1kP9KvTp9uTJ2iOLw");
+        assert_eq!(selected.as_deref(), Some("Ox9G2RoJ"));
+
+        let (_, _, selected) = extract_folder_link_details(
+            "https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw",
+        )
+        .unwrap();
+        assert_eq!(selected, None);
     }
 
     #[test]
