@@ -371,14 +371,122 @@ pub async fn get_file_metadata(client: &Client, link: &str, sid: Option<&str>) -
     Ok((fname, fsize, file_key))
 }
 
+// --- Quota (storage + transfer) ---
+
+/// Everything MEGA reports about quotas (`a:"uq"`).
+///
+/// MEGA keeps two independent counters:
+/// - **storage**: bytes stored in the account (`cstrg` / `mstrg`);
+/// - **transfer**: bytes downloaded/streamed, either as an account monthly
+///   allowance for paid plans (`mxfer`, `caxfer`, `csxfer`) or as the free
+///   *per-IP* rolling window (`tah`: 6 hourly buckets, `bt`: their age).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuotaInfo {
+    /// Storage used / allowed (0 when unknown).
+    pub storage_used: u64,
+    pub storage_max: u64,
+    /// Account transfer allowance (`mxfer`) and what was used (`caxfer`+`tuo`).
+    pub transfer_max: u64,
+    pub transfer_used: u64,
+    /// Bytes served from this account's links (`csxfer` / `tua`).
+    pub transfer_served: u64,
+    /// Bytes currently reserved by running downloads (`tar`).
+    pub transfer_reserved: u64,
+    /// Free, IP based quota: six hourly buckets (`tah`).
+    pub ip_buckets: Vec<u64>,
+    /// Age in seconds of the current bucket window (`bt`).
+    pub bucket_age: Option<u64>,
+}
+
+impl QuotaInfo {
+    /// Bytes downloaded from this IP during the rolling six hour window.
+    pub fn ip_transfer_used(&self) -> u64 {
+        self.ip_buckets.iter().sum()
+    }
+
+    /// True when MEGA reports a paid/account transfer allowance.
+    pub fn has_account_transfer(&self) -> bool {
+        self.transfer_max > 0 || self.transfer_used > 0
+    }
+
+    /// True when the account allowance is spent.
+    pub fn account_exhausted(&self) -> bool {
+        self.transfer_max > 0 && self.transfer_used >= self.transfer_max
+    }
+}
+
+/// Read a number that MEGA may send as a plain value or inside an array.
+fn json_number(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return Some(number);
+    }
+    value
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(|first| first.as_u64())
+}
+
+fn field(object: &Value, names: &[&str]) -> u64 {
+    for name in names {
+        if let Some(number) = json_number(&object[*name]) {
+            return number;
+        }
+    }
+    0
+}
+
+/// Parse an `a:"uq"` response.
+fn parse_quota(object: &Value) -> QuotaInfo {
+    let ip_buckets = object["tah"]
+        .as_array()
+        .map(|values| values.iter().filter_map(|value| value.as_u64()).collect())
+        .unwrap_or_default();
+
+    // MEGA splits the account transfer usage in an "own" part (`caxfer`, or
+    // `tuo` on older responses) and a "served from my links" part (`csxfer` /
+    // `tua`); the SDK adds them, so do we.
+    let mut info = QuotaInfo {
+        storage_used: field(object, &["cstrg"]),
+        storage_max: field(object, &["mstrg"]),
+        transfer_max: field(object, &["mxfer"]),
+        transfer_used: field(object, &["caxfer"]) + field(object, &["tuo"]),
+        transfer_served: field(object, &["csxfer"]) + field(object, &["tua"]),
+        transfer_reserved: field(object, &["tar"]),
+        ip_buckets,
+        bucket_age: object["bt"].as_u64(),
+    };
+
+    // Anonymous folder links answer per node (`cstrgn`, `mxfern`, ...).
+    if info.storage_used == 0 {
+        info.storage_used = field(object, &["cstrgn"]);
+    }
+    if info.storage_max == 0 {
+        info.storage_max = field(object, &["mstrgn"]);
+    }
+    if info.transfer_max == 0 {
+        info.transfer_max = field(object, &["mxfern"]);
+    }
+    if info.transfer_used == 0 {
+        info.transfer_used = field(object, &["caxfern"]);
+    }
+
+    info
+}
+
+/// Ask MEGA for the storage and transfer quotas (`a:"uq"`, `v:2`).
+pub async fn get_quota_info(client: &Client, sid: Option<&str>) -> Result<QuotaInfo> {
+    let request = r#"[{"a":"uq","xfer":1,"strg":1,"v":2}]"#;
+    let res = raw_api_request(client, request, sid).await?;
+    let object = res.get(0).cloned().unwrap_or(Value::Null);
+    Ok(parse_quota(&object))
+}
+
 // --- Get quota ---
 
+#[allow(dead_code)]
 pub async fn get_quota(client: &Client, session: &MegaSession) -> Result<(u64, u64)> {
-    let request = r#"[{"a":"uq","xfer":1,"strg":1}]"#;
-    let res = raw_api_request(client, request, session.sid.as_deref()).await?;
-    let used = res[0]["cstrg"].as_u64().unwrap_or(0);
-    let total = res[0]["mstrg"].as_u64().unwrap_or(0);
-    Ok((used, total))
+    let info = get_quota_info(client, session.sid.as_deref()).await?;
+    Ok((info.storage_used, info.storage_max))
 }
 
 // --- Init upload ---
@@ -624,16 +732,64 @@ impl FileNode {
 
 // --- Link parsing helpers ---
 
+/// Characters that are never part of a MEGA link but often come along when the
+/// link is copied from a chat, a markdown document or an e-mail.
+const LINK_WRAPPERS: &str = "\"'`<>«»“”‘’()[]{}";
+
+/// Extract the actual MEGA URL from whatever the user pasted.
+///
+/// Handles the usual copy/paste accidents:
+/// - markdown `[label](https://mega.nz/...)`
+/// - quotes, backticks or angle brackets around the link
+/// - trailing punctuation (`.`, `,`, `)`, ...)
+/// - leading text ("tiens: https://mega.nz/...")
+pub fn clean_link_input(input: &str) -> String {
+    let trimmed = input.trim();
+
+    // Markdown link: keep the target, not the label.
+    let markdown = regex::Regex::new(r"\[[^\]]*\]\(([^)\s]+)\)").unwrap();
+    let text = match markdown.captures(trimmed) {
+        Some(caps) => caps[1].to_string(),
+        None => trimmed.to_string(),
+    };
+
+    // Take the first MEGA URL found in the text.
+    let url = regex::Regex::new(
+        r#"(?i)(?:https?://)?mega\.(?:nz|co\.nz)/[^\s)\]}>"'«»]+"#,
+    )
+    .unwrap();
+    if let Some(found) = url.find(&text) {
+        return found.as_str().to_string();
+    }
+
+    // No recognisable URL: just drop wrappers and trailing punctuation.
+    text.trim_matches(|c: char| c.is_whitespace() || LINK_WRAPPERS.contains(c))
+        .trim_end_matches(['.', ',', ';', ':', '!', '?'])
+        .to_string()
+}
+
 pub fn normalize_mega_link(link: &str) -> String {
-    let mut s = link.to_string();
-    // New format -> legacy
+    let mut s = clean_link_input(link);
+
+    // New format -> legacy. Keys stop at anything that cannot belong to a
+    // base64 URL-safe key, so a link pasted with trailing junk stays valid.
+    let key = r#"[^\s)\]}>"'«»]+"#;
     let patterns = [
-        (r"mega\.nz/file/([^#]+)#([^\s]+)", "https://mega.nz/#!$1!$2"),
-        (r"mega\.nz/folder/([^#]+)#([^\s/]+)/file/([^\s/]+)", "https://mega.nz/#F*$3!$1!$2"),
-        (r"mega\.nz/folder/([^#]+)#([^\s]+)", "https://mega.nz/#F!$1!$2"),
+        (
+            format!(r"mega\.nz/file/([^#]+)#({})", key),
+            "https://mega.nz/#!$1!$2",
+        ),
+        (
+            r#"mega\.nz/folder/([^#]+)#([^\s)\]}>"'«»/]+)/file/([^\s)\]}>"'«»/]+)"#.to_string(),
+            "https://mega.nz/#F*$3!$1!$2",
+        ),
+        (
+            format!(r"mega\.nz/folder/([^#]+)#({})", key),
+            "https://mega.nz/#F!$1!$2",
+        ),
     ];
     for (pat, rep) in patterns {
-        let re = regex::Regex::new(pat).unwrap();
+        let re = regex::Regex::new(&pat).unwrap();
         s = re.replace(&s, rep).to_string();
     }
     if !s.starts_with("http") && s.contains("mega.nz") {
@@ -672,8 +828,20 @@ pub fn extract_folder_id_and_key(link: &str) -> Result<(String, String)> {
     let re = regex::Regex::new(r"#F!([^!]+)!([^!#\s/]+)")?;
     let caps = re
         .captures(&link)
-        .ok_or(anyhow!("lien de dossier invalide"))?;
-    Ok((caps[1].to_string(), caps[2].to_string()))
+        .ok_or_else(|| anyhow!("lien de dossier invalide: {}", clean_link_input(&link)))?;
+
+    let folder_id = caps[1].to_string();
+    let folder_key = caps[2].to_string();
+
+    // A valid folder key is base64 (URL-safe, usually unpadded).
+    if url_base64_decode(&folder_key).is_err() {
+        return Err(anyhow!(
+            "cle de dossier illisible ({}). Verifie que le lien est complet et sans texte colle autour.",
+            clean_link_input(&link)
+        ));
+    }
+
+    Ok((folder_id, folder_key))
 }
 
 pub fn is_folder_link(link: &str) -> bool {
@@ -682,7 +850,8 @@ pub fn is_folder_link(link: &str) -> bool {
 }
 
 pub fn is_mega_link(link: &str) -> bool {
-    link.contains("mega.nz") || link.contains("mega.co.nz")
+    let cleaned = clean_link_input(link);
+    cleaned.contains("mega.nz") || cleaned.contains("mega.co.nz")
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -702,7 +871,7 @@ pub fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt_node_key, extract_folder_id_and_key};
+    use super::{decrypt_node_key, extract_folder_id_and_key, parse_quota, QuotaInfo};
     use crate::crypto::{
         aes_ecb_encrypt, encrypt_mega_attr, node_aes_key, url_base64_encode,
     };
@@ -796,5 +965,118 @@ mod tests {
         .unwrap();
         assert_eq!(id, "2wkxkQAB");
         assert_eq!(key, "IbHZz1kP9KvTp9uTJ2iOLw");
+    }
+
+    #[test]
+    fn free_ip_quota_is_parsed_from_hourly_buckets() {
+        let payload = serde_json::json!({
+            "bt": 7200,
+            "tah": [1_000_000_000u64, 2_000_000_000u64, 500_000_000u64, -1, -1, -1],
+            "tar": 12_345,
+            "cstrg": 3_000_000_000u64,
+            "mstrg": 21_474_836_480u64,
+            "rtt": 0,
+            "s": 3600
+        });
+
+        let info = parse_quota(&payload);
+        // Empty buckets are sent as -1 and skipped.
+        assert_eq!(info.ip_buckets.len(), 3);
+        assert_eq!(info.ip_transfer_used(), 3_500_000_000);
+        assert_eq!(info.bucket_age, Some(7200));
+        assert_eq!(info.transfer_reserved, 12_345);
+        assert_eq!(info.storage_used, 3_000_000_000);
+        assert_eq!(info.storage_max, 21_474_836_480);
+        assert!(!info.has_account_transfer());
+    }
+
+    #[test]
+    fn paid_transfer_allowance_is_parsed() {
+        let payload = serde_json::json!({
+            "mxfer": 1_099_511_627_776u64,
+            "caxfer": 250_000_000_000u64,
+            "tuo": 5_000_000_000u64,
+            "csxfer": 1_000_000_000u64,
+            "tua": 2_000_000_000u64,
+            "cstrg": 900_000_000_000u64,
+            "mstrg": 2_199_023_255_552u64,
+            "tah": [-1, -1, -1, -1, -1, -1]
+        });
+
+        let info = parse_quota(&payload);
+        assert!(info.has_account_transfer());
+        assert_eq!(info.transfer_max, 1_099_511_627_776);
+        assert_eq!(info.transfer_used, 255_000_000_000);
+        assert_eq!(info.transfer_served, 3_000_000_000);
+        assert!(info.ip_buckets.is_empty());
+        assert_eq!(info.ip_transfer_used(), 0);
+        assert!(!info.account_exhausted());
+    }
+
+    #[test]
+    fn anonymous_per_node_quota_is_parsed() {
+        let payload = serde_json::json!({
+            "cstrgn": [7_000_000u64, 3_000_000u64],
+            "mstrgn": [10_000_000u64, 10_000_000u64]
+        });
+
+        let info = parse_quota(&payload);
+        assert_eq!(info.storage_used, 7_000_000);
+        assert_eq!(info.storage_max, 10_000_000);
+    }
+
+    #[test]
+    fn empty_quota_payload_is_harmless() {
+        let info = parse_quota(&serde_json::json!({}));
+        assert_eq!(info, QuotaInfo::default());
+        assert!(!info.has_account_transfer());
+        assert!(!info.account_exhausted());
+    }
+
+    #[test]
+    fn links_survive_a_messy_copy_paste() {
+        use super::clean_link_input;
+
+        let expected = "https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw";
+
+        // Markdown link wrapped in quotes (what chat clients produce).
+        let pasted = "'[https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw](https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw)'";
+        assert_eq!(clean_link_input(pasted), expected);
+
+        // And the folder parsing must work on it.
+        let (id, key) = extract_folder_id_and_key(pasted).unwrap();
+        assert_eq!(id, "2wkxkQAB");
+        assert_eq!(key, "IbHZz1kP9KvTp9uTJ2iOLw");
+
+        // Quotes, angle brackets, trailing period.
+        assert_eq!(
+            clean_link_input("\"https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw\"."),
+            expected
+        );
+        assert_eq!(
+            clean_link_input("<https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw>"),
+            expected
+        );
+        assert_eq!(
+            clean_link_input("tiens: https://mega.nz/folder/2wkxkQAB#IbHZz1kP9KvTp9uTJ2iOLw ok ?"),
+            expected
+        );
+
+        // Already clean.
+        assert_eq!(clean_link_input(expected), expected);
+    }
+
+    #[test]
+    fn truncated_folder_key_is_reported_clearly() {
+        // A key with a character that cannot be base64.
+        let error = extract_folder_id_and_key("https://mega.nz/folder/2wkxkQAB#IbHZz1k*P9KvTp9u")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("cle de dossier illisible"),
+            "unexpected message: {}",
+            error
+        );
     }
 }

@@ -1,6 +1,7 @@
 mod api;
 mod crypto;
 mod download;
+mod proxy;
 mod upload;
 
 use anyhow::Result;
@@ -16,6 +17,47 @@ struct AppState {
     download_path: String,
     workers: usize,
     speed_limit: u64,
+    /// How long to pause when MEGA answers HTTP 509 (0 = do not wait).
+    quota_wait: std::time::Duration,
+    /// Optional HTTP/SOCKS5 proxy used for every MEGA request.
+    proxy: Option<String>,
+    /// Proxies loaded from a list file.
+    proxies: Vec<proxy::ProxyEntry>,
+    /// Index of the active proxy in `proxies`.
+    proxy_index: usize,
+}
+
+impl AppState {
+    /// Activate the proxy at `index` in the loaded list.
+    fn select_proxy(&mut self, index: usize) -> Result<()> {
+        if self.proxies.is_empty() {
+            return Ok(());
+        }
+        self.proxy_index = index % self.proxies.len();
+        self.proxy = Some(self.proxies[self.proxy_index].url.clone());
+        self.apply_proxy()
+    }
+
+    fn proxy_label(&self) -> String {
+        match &self.proxy {
+            Some(url) => url.clone(),
+            None => "aucun (connexion directe)".to_string(),
+        }
+    }
+
+    /// Rebuild the HTTP client after a proxy change.
+    fn apply_proxy(&mut self) -> Result<()> {
+        self.client = build_client(self.proxy.as_deref())?;
+        Ok(())
+    }
+
+    fn download_config(&self) -> download::DownloadConfig {
+        download::DownloadConfig {
+            workers: self.workers,
+            speed_limit: self.speed_limit,
+            quota_wait: self.quota_wait,
+        }
+    }
 }
 
 fn clear() {
@@ -23,12 +65,17 @@ fn clear() {
 }
 
 fn pause() {
-    let _: String = Input::new()
-        .with_prompt("Appuie sur Entree pour continuer")
+    let answer: String = Input::new()
+        .with_prompt("Appuie sur Entree pour continuer  (q = quitter)")
         .allow_empty(true)
         .default(String::new())
         .interact_text()
         .unwrap_or_default();
+
+    if answer.trim().eq_ignore_ascii_case("q") {
+        println!("Bye!");
+        std::process::exit(0);
+    }
 }
 
 fn ask(prompt: &str) -> String {
@@ -59,10 +106,12 @@ async fn menu_download_link(state: &mut AppState) {
     }
 
     if !api::is_mega_link(&link) {
-        println!("\n  Lien MEGA invalide!");
+        println!("\n  Lien MEGA invalide: {}", api::clean_link_input(&link));
+        println!("  Format attendu: https://mega.nz/folder/<id>#<cle>");
         pause();
         return;
     }
+    let link = api::clean_link_input(&link);
 
     let path = ask_default("Dossier destination", &state.download_path);
     let workers_str = ask_default("Connexions paralleles", &state.workers.to_string());
@@ -74,23 +123,51 @@ async fn menu_download_link(state: &mut AppState) {
     }
     println!("  Destination: {}", path);
     println!("  Connexions:  {}", workers);
+    println!(
+        "  Quota 509:   {}",
+        if state.quota_wait.is_zero() {
+            "arret et reprise plus tard".to_string()
+        } else {
+            format!("attente de {} min puis reprise", state.quota_wait.as_secs() / 60)
+        }
+    );
+    println!();
+
+    let mut config = state.download_config();
+    config.workers = workers;
+
+    let sid = state.session.as_ref().and_then(|s| s.sid.as_deref());
+    if let Ok(info) = api::get_quota_info(&state.client, sid).await {
+        for line in describe_quota(&info) {
+            println!("  {}", line);
+        }
+    }
     println!();
 
     let result = if folder {
-        download::download_folder(&state.client, &link, &path, workers, state.speed_limit).await
+        download::download_folder(&state.client, &link, &path, config)
+            .await
+            .map(|report| {
+                if report.quota_exhausted {
+                    println!("\n  Dossier interrompu par le quota MEGA (reprise possible)");
+                    println!("  Relancer plus tard, ou depuis une autre sortie (Parametres -> 6).");
+                } else if report.failed == 0 {
+                    println!("\n  Dossier telecharge!");
+                } else {
+                    println!(
+                        "\n  Dossier partiellement telecharge ({} en echec)",
+                        report.failed
+                    );
+                }
+            })
     } else {
-        download::download_from_link(&state.client, &link, &path, workers, state.speed_limit).await
+        download::download_from_link(&state.client, &link, &path, config)
+            .await
+            .map(|_| println!("\n  Telechargement termine!"))
     };
 
-    match result {
-        Ok(()) => {
-            if folder {
-                println!("\n  Dossier telecharge!");
-            } else {
-                println!("\n  Telechargement termine!");
-            }
-        }
-        Err(e) => println!("\n  Erreur: {}", e),
+    if let Err(e) = result {
+        println!("\n  Erreur: {}", e);
     }
 
     pause();
@@ -201,11 +278,15 @@ async fn menu_stream(state: &mut AppState) {
 
     let players = &["mpv", "vlc", "ffplay"];
     let sel = Select::new()
-        .with_prompt("Lecteur")
+        .with_prompt("Lecteur  (q pour annuler)")
         .items(players)
         .default(0)
-        .interact()
-        .unwrap_or(0);
+        .interact_opt()
+        .ok()
+        .flatten();
+    let Some(sel) = sel else {
+        return;
+    };
     let player = players[sel];
 
     // Get file info
@@ -268,16 +349,17 @@ async fn menu_quota(state: &mut AppState) {
         }
     };
 
-    match api::get_quota(&state.client, session).await {
-        Ok((used, total)) => {
-            let pct = if total > 0 {
-                (used as f64 / total as f64 * 100.0) as u64
-            } else {
-                0
-            };
-            println!("  Utilise: {} / {} ({}%)", api::format_bytes(used), api::format_bytes(total), pct);
-            let free = total.saturating_sub(used);
-            println!("  Libre:   {}", api::format_bytes(free));
+    match api::get_quota_info(&state.client, session.sid.as_deref()).await {
+        Ok(info) => {
+            for line in describe_quota(&info) {
+                println!("  {}", line);
+            }
+            if info.storage_max > 0 {
+                println!(
+                    "  Stockage libre: {}",
+                    api::format_bytes(info.storage_max.saturating_sub(info.storage_used))
+                );
+            }
         }
         Err(e) => println!("  Erreur: {}", e),
     }
@@ -333,10 +415,12 @@ async fn menu_login(state: &mut AppState) {
 
         let choices = &["Changer de compte", "Deconnecter", "Retour"];
         let sel = Select::new()
-            .with_prompt("Action")
+            .with_prompt("Action  (q pour revenir)")
             .items(choices)
             .default(2)
-            .interact()
+            .interact_opt()
+            .ok()
+            .flatten()
             .unwrap_or(2);
 
         match sel {
@@ -410,20 +494,47 @@ async fn menu_settings(state: &mut AppState) {
             state.speed_limit.to_string()
         }
     );
+    println!(
+        "  4. Attente quota 509:         {}",
+        if state.quota_wait.is_zero() {
+            "desactivee (arret propre)".to_string()
+        } else {
+            format!("{} min", state.quota_wait.as_secs() / 60)
+        }
+    );
+    println!("  5. Proxy (HTTP/SOCKS5):       {}", state.proxy_label());
+    println!(
+        "  6. Liste de proxies (.txt):   {}",
+        if state.proxies.is_empty() {
+            "aucune".to_string()
+        } else {
+            format!(
+                "{} proxy(ies), actif: {}/{}",
+                state.proxies.len(),
+                state.proxy_index + 1,
+                state.proxies.len()
+            )
+        }
+    );
     println!();
 
     let choices = &[
         "Changer dossier de telechargement",
         "Changer connexions paralleles",
         "Changer limite de vitesse",
+        "Changer attente quota 509",
+        "Changer le proxy (HTTP/SOCKS5)",
+        "Charger une liste de proxies (.txt)",
         "Retour",
     ];
     let sel = Select::new()
-        .with_prompt("Modifier")
+        .with_prompt("Modifier  (q pour revenir)")
         .items(choices)
-        .default(3)
-        .interact()
-        .unwrap_or(3);
+        .default(6)
+        .interact_opt()
+        .ok()
+        .flatten()
+        .unwrap_or(6);
 
     match sel {
         0 => {
@@ -436,6 +547,70 @@ async fn menu_settings(state: &mut AppState) {
         2 => {
             let s = ask_default("Limite KiB/s (0 = illimite)", &state.speed_limit.to_string());
             state.speed_limit = s.parse().unwrap_or(0);
+        }
+        3 => {
+            let current = state.quota_wait.as_secs() / 60;
+            let s = ask_default(
+                "Attente apres HTTP 509, en minutes (0 = ne pas attendre)",
+                &current.to_string(),
+            );
+            state.quota_wait = std::time::Duration::from_secs(s.parse::<u64>().unwrap_or(0) * 60);
+        }
+        4 => {
+            println!();
+            println!("  Exemples:");
+            println!("    socks5h://127.0.0.1:9050   (Tor, DNS resolu par le proxy)");
+            println!("    socks5://127.0.0.1:1080    (SSH -D, DNS resolu en local)");
+            println!("    http://127.0.0.1:8080      (proxy HTTP)");
+            println!("  Vide = connexion directe.");
+            println!();
+            let input = ask_default("Proxy", state.proxy.as_deref().unwrap_or(""));
+            let cleaned = input.trim().to_string();
+            let previous = state.proxy.clone();
+            state.proxy = if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            };
+
+            if let Err(e) = state.apply_proxy() {
+                println!("\n  Proxy refuse: {}", e);
+                state.proxy = previous;
+                let _ = state.apply_proxy();
+            } else {
+                state.proxies.clear();
+                state.proxy_index = 0;
+                println!("\n  Proxy actif: {}", state.proxy_label());
+            }
+        }
+        5 => {
+            println!();
+            println!("  Un proxy par ligne. Formats acceptes:");
+            println!("    1.2.3.4:8080            (HTTP)");
+            println!("    *1.2.3.4:1080           (SOCKS5)");
+            println!("    socks5h://127.0.0.1:9050");
+            println!("    user:pass@1.2.3.4:8080");
+            println!("  Les lignes vides et celles commencant par # sont ignorees.");
+            println!();
+            let path = ask_default("Fichier de proxies", "");
+            let path = path.trim();
+            if path.is_empty() {
+                return;
+            }
+
+            match proxy::load_file(std::path::Path::new(path)) {
+                Ok(entries) => {
+                    println!("\n  {} proxy(ies) charge(s)", entries.len());
+                    state.proxies = entries;
+                    state.proxy_index = 0;
+                    if let Err(e) = state.select_proxy(0) {
+                        println!("  Proxy refuse: {}", e);
+                    } else {
+                        println!("  Actif: {}", state.proxy_label());
+                    }
+                }
+                Err(e) => println!("\n  Erreur: {}", e),
+            }
         }
         _ => {}
     }
@@ -477,24 +652,775 @@ fn print_file_tree(nodes: &[api::FileNode]) {
     print_node(nodes, root_handle, 0);
 }
 
+// --- Mode ligne de commande (scriptable) ---
+
+struct CliArgs {
+    link: String,
+    dest: String,
+    workers: usize,
+    speed_limit: u64,
+    quota_wait: std::time::Duration,
+    list: bool,
+    /// Print the remaining transfer quota for this IP and exit.
+    quota_only: bool,
+    /// Optional HTTP/SOCKS5 proxy for every MEGA request (e.g. a VPN endpoint).
+    proxy: Option<String>,
+    /// Optional file with one proxy per line.
+    proxy_file: Option<String>,
+    /// Probe every proxy of the list and exit.
+    proxy_check: bool,
+    /// Write the proxies that answered to this file.
+    proxy_check_out: Option<String>,
+    /// Stop the check once this many proxies answered (0 = whole list).
+    proxy_check_stop: usize,
+    /// How the first proxy is picked.
+    proxy_mode: proxy::ProxyMode,
+}
+
+fn print_cli_help() {
+    println!(
+        "MegaCLI v{} - client MEGA en Rust\n\n\
+Usage:\n  \
+  megacli                          menu interactif\n  \
+  megacli <lien> [options]         telechargement direct (fichier ou dossier)\n  \
+  megacli --list <lien>            affiche l'arborescence sans rien telecharger\n  \
+  megacli --proxy-file p.txt --proxy-check   teste une liste de proxies\n\n\
+Options:\n  \
+  -d, --dest <dir>        dossier de destination (defaut: dossier Telechargements)\n  \
+  -w, --workers <1-20>    connexions paralleles par fichier (defaut: 6)\n  \
+  -s, --speed <KiB/s>     limite de vitesse, 0 = illimite (defaut: 0)\n  \
+  -q, --quota-wait <min>  en cas de quota MEGA (HTTP 509), attendre N minutes\n                          \
+puis reprendre au lieu de s'arreter (defaut: 0)\n  \
+  -l, --list              lister le contenu du dossier\n  \
+      --quota             afficher le quota de transfert restant pour cette IP\n  \
+      --proxy <url>       proxy HTTP/SOCKS5 pour toutes les requetes\n  \
+                          (ex: socks5h://127.0.0.1:9050)\n  \
+      --proxy-file <txt>  liste de proxies, un par ligne\n  \
+                          (1.2.3.4:8080, *1.2.3.4:1080, socks5://h:p,\n  \
+                           user:pass@h:p, h:p@base64(user:pass))\n  \
+      --proxy-check       teste chaque proxy de la liste (latence + quota)\n  \
+      --proxy-check-out <f>  ecrit les proxies qui repondent dans <f>\n  \
+                          (implique --proxy-check)\n  \
+      --proxy-check-stop <n> s'arrete apres n proxies valides (0 = toute la liste)\n  \
+      --proxy-mode <m>    first | random (defaut: first)\n  \
+  -h, --help              cette aide\n\n\
+Codes de sortie: 0 succes, 1 erreur, 2 quota MEGA atteint (relancer plus tard).",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// Returns `None` when no link was given (interactive menu).
+fn parse_cli() -> Option<CliArgs> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return None;
+    }
+
+    let mut link: Option<String> = None;
+    let mut dest: Option<String> = None;
+    let mut workers = DEFAULT_WORKERS;
+    let mut speed_limit = 0u64;
+    let mut quota_wait_min = 0u64;
+    let mut list = false;
+    let mut proxy: Option<String> = None;
+    let mut proxy_file: Option<String> = None;
+    let mut proxy_check = false;
+    let mut proxy_check_out: Option<String> = None;
+    let mut proxy_check_stop = 0usize;
+    let mut proxy_mode = proxy::ProxyMode::First;
+    let mut proxy_mode_set = false;
+    let mut quota_only = false;
+
+    let mut index = 0usize;
+    while index < args.len() {
+        let current = args[index].clone();
+        match current.as_str() {
+            "-h" | "--help" => {
+                print_cli_help();
+                std::process::exit(0);
+            }
+            "-l" | "--list" => list = true,
+            "--quota" => quota_only = true,
+            "--proxy" => {
+                index += 1;
+                proxy = args.get(index).cloned();
+            }
+            "--proxy-file" => {
+                index += 1;
+                proxy_file = args.get(index).cloned();
+            }
+            "--proxy-check" => proxy_check = true,
+            "--proxy-check-out" => {
+                index += 1;
+                proxy_check_out = args.get(index).cloned();
+            }
+            "--proxy-check-stop" => {
+                index += 1;
+                proxy_check_stop = args
+                    .get(index)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+            }
+            "--proxy-mode" => {
+                index += 1;
+                match args.get(index).and_then(|value| proxy::ProxyMode::parse(value)) {
+                    Some(mode) => {
+                        proxy_mode = mode;
+                        proxy_mode_set = true;
+                    }
+                    None => {
+                        eprintln!("Mode invalide (first | random)");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "-d" | "--dest" => {
+                index += 1;
+                dest = args.get(index).cloned();
+            }
+            "-w" | "--workers" => {
+                index += 1;
+                workers = args
+                    .get(index)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(DEFAULT_WORKERS)
+                    .clamp(1, 20);
+            }
+            "-s" | "--speed" => {
+                index += 1;
+                speed_limit = args
+                    .get(index)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+            "-q" | "--quota-wait" => {
+                index += 1;
+                quota_wait_min = args
+                    .get(index)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+            other if !other.starts_with('-') => link = Some(other.to_string()),
+            other => {
+                eprintln!("Option inconnue: {} (voir --help)", other);
+                std::process::exit(1);
+            }
+        }
+
+        index += 1;
+    }
+
+    // `--proxy-check-out` only makes sense with `--proxy-check`: asking for the
+    // file is asking for the check, so imply it instead of failing.
+    if (proxy_check_out.is_some() || proxy_check_stop > 0) && !proxy_check {
+        proxy_check = true;
+        println!("--proxy-check-out implique --proxy-check.");
+    }
+    if proxy_mode_set
+        && proxy_file.is_none()
+        && std::env::var("MEGACLI_PROXY_FILE").is_err()
+    {
+        eprintln!("Attention: --proxy-mode sans --proxy-file n'a aucun effet (proxy unique ou direct).");
+    }
+
+    let link = match link {
+        Some(link) => link,
+        None if quota_only || proxy_check => String::new(),
+        None => {
+            eprintln!("Aucun lien MEGA fourni (voir --help)");
+            std::process::exit(1);
+        }
+    };
+
+    Some(CliArgs {
+        link,
+        dest: dest.unwrap_or_else(default_download_dir),
+        workers,
+        speed_limit,
+        quota_wait: std::time::Duration::from_secs(quota_wait_min * 60),
+        list,
+        quota_only,
+        proxy,
+        proxy_file,
+        proxy_check,
+        proxy_check_out,
+        proxy_check_stop,
+        proxy_mode,
+    })
+}
+
+fn default_download_dir() -> String {
+    dirs::download_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+/// Proxy configured through MEGACLI_PROXY, if any.
+fn env_proxy() -> Option<String> {
+    std::env::var("MEGACLI_PROXY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Accept only the proxy URL shapes reqwest can actually use.
+fn validate_proxy(url: &str) -> Result<()> {
+    let lower = url.to_ascii_lowercase();
+    let supported = ["http://", "https://", "socks5://", "socks5h://", "socks4://"];
+    if supported.iter().any(|prefix| lower.starts_with(prefix)) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "scheme non supporte (attendu http://, https://, socks5:// ou socks5h://)"
+        ))
+    }
+}
+
+fn build_client(proxy: Option<&str>) -> Result<Client> {
+    let mut builder = Client::builder().timeout(std::time::Duration::from_secs(120));
+
+    if let Some(url) = proxy {
+        validate_proxy(url)?;
+        let proxy = reqwest::Proxy::all(url)
+            .map_err(|e| anyhow::anyhow!("proxy invalide ({}): {}", url, e))?;
+        builder = builder.proxy(proxy);
+    }
+
+    Ok(builder.build()?)
+}
+
+/// Print the quota MEGA reports (storage + transfer).
+fn describe_quota(info: &api::QuotaInfo) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if info.has_account_transfer() {
+        let percent = if info.transfer_max > 0 {
+            format!(
+                " ({:.1}%)",
+                info.transfer_used as f64 / info.transfer_max as f64 * 100.0
+            )
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "Transfert du compte: {} utilises / {}{}",
+            api::format_bytes(info.transfer_used),
+            if info.transfer_max > 0 {
+                api::format_bytes(info.transfer_max)
+            } else {
+                "limite inconnue".to_string()
+            },
+            percent
+        ));
+        if info.transfer_served > 0 {
+            lines.push(format!(
+                "  dont {} servis depuis tes liens",
+                api::format_bytes(info.transfer_served)
+            ));
+        }
+        if info.account_exhausted() {
+            lines.push("  Quota du compte epuise: attends le renouvellement mensuel.".to_string());
+        }
+    }
+
+    if !info.ip_buckets.is_empty() || info.ip_transfer_used() > 0 {
+        lines.push(format!(
+            "Transfert de cette IP (fenetre glissante de 6 h): {} telecharges sur les 6 dernieres heures",
+            api::format_bytes(info.ip_transfer_used())
+        ));
+        if let Some(age) = info.bucket_age {
+            lines.push(format!(
+                "  Fenetre horaire en cours depuis {} ({}/6)",
+                format_secs(age),
+                (age / 3600 + 1).min(6)
+            ));
+        }
+        lines.push(
+            "  MEGA ne publie pas la limite gratuite (~5 Go, variable selon pays et charge)."
+                .to_string(),
+        );
+    }
+
+    if info.storage_max > 0 || info.storage_used > 0 {
+        lines.push(format!(
+            "Stockage: {} / {}",
+            api::format_bytes(info.storage_used),
+            if info.storage_max > 0 {
+                api::format_bytes(info.storage_max)
+            } else {
+                "illimite/inconnu".to_string()
+            }
+        ));
+    }
+
+    if info.transfer_reserved > 0 {
+        lines.push(format!(
+            "Reserve par des telechargements en cours: {}",
+            api::format_bytes(info.transfer_reserved)
+        ));
+    }
+
+    lines
+}
+
+fn format_secs(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+async fn print_quota(client: &Client, sid: Option<&str>) -> Result<()> {
+    match api::get_quota_info(client, sid).await {
+        Ok(info) => {
+            for line in describe_quota(&info) {
+                println!("  {}", line);
+            }
+        }
+        Err(e) => println!("  Quota indisponible: {}", e),
+    }
+    Ok(())
+}
+
+/// Proxies to use, in order. Empty means "direct connection".
+fn resolve_proxies(args: &CliArgs) -> Result<Vec<proxy::ProxyEntry>> {
+    if let Some(path) = &args.proxy_file {
+        return proxy::load_file(std::path::Path::new(path));
+    }
+    if let Some(url) = &args.proxy {
+        proxy::validate(url)?;
+        return Ok(vec![proxy::ProxyEntry {
+            url: url.clone(),
+            raw: url.clone(),
+        }]);
+    }
+    if let Some(path) = std::env::var("MEGACLI_PROXY_FILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return proxy::load_file(std::path::Path::new(&path));
+    }
+    if let Some(url) = env_proxy() {
+        proxy::validate(&url)?;
+        return Ok(vec![proxy::ProxyEntry {
+            url: url.clone(),
+            raw: url,
+        }]);
+    }
+    Ok(Vec::new())
+}
+
+/// Shorten a proxy URL for the check table.
+fn short_proxy(url: &str) -> String {
+    let mut label = url.to_string();
+    if label.len() > 42 {
+        label.truncate(39);
+        label.push_str("...");
+    }
+    label
+}
+
+/// How many proxies are probed at the same time.
+const CHECK_CONCURRENCY: usize = 32;
+/// Timeout for one probe.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How many different proxies are tried before giving up on finding a live one.
+const START_ATTEMPTS: usize = 25;
+
+/// Probe every proxy of the list: can MEGA be reached, how fast, and how much
+/// quota is left on that exit IP. Only the working entries are printed, the
+/// alive ones can be written to a shorter list.
+async fn check_proxies(
+    entries: &[proxy::ProxyEntry],
+    out: Option<&str>,
+    stop_after: usize,
+) -> Result<()> {
+    use futures::stream::{self, StreamExt};
+    use indicatif::{ProgressBar, ProgressStyle};
+
+    if entries.is_empty() {
+        println!("Aucun proxy a verifier (--proxy-file ou MEGACLI_PROXY_FILE).");
+        return Ok(());
+    }
+
+    println!(
+        "  {} proxy(ies), {} testes en parallele, {} s max par proxy.",
+        entries.len(),
+        CHECK_CONCURRENCY,
+        CHECK_TIMEOUT.as_secs()
+    );
+
+    let pb = ProgressBar::new(entries.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template("  {bar:30.cyan/blue} {pos}/{len}  OK: {msg}  ETA {eta}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=>-"),
+    );
+    pb.set_message("0");
+
+    // (index in the list, quota used on that exit IP, latency)
+    let mut working: Vec<(usize, u64, std::time::Duration)> = Vec::new();
+    let mut checks = stream::iter(entries.iter().enumerate().map(|(index, entry)| async move {
+        let started = std::time::Instant::now();
+        let outcome = match build_client(Some(&entry.url)) {
+            Ok(client) => {
+                match tokio::time::timeout(CHECK_TIMEOUT, api::get_quota_info(&client, None)).await {
+                    Ok(Ok(info)) => Ok((info.ip_transfer_used(), started.elapsed())),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err(format!("timeout ({}s)", CHECK_TIMEOUT.as_secs())),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        (index, outcome)
+    }))
+    .buffer_unordered(CHECK_CONCURRENCY);
+
+    while let Some((index, outcome)) = checks.next().await {
+        if let Ok((used, elapsed)) = outcome {
+            working.push((index, used, elapsed));
+            pb.set_message(working.len().to_string());
+            let url = &entries[index].url;
+            pb.suspend(|| {
+                println!(
+                    "  OK    {:<40} {:>9} utilises (IP)   {:>5} ms   [{}]",
+                    short_proxy(url),
+                    api::format_bytes(used),
+                    elapsed.as_millis(),
+                    index + 1
+                );
+            });
+        }
+
+        pb.inc(1);
+        if stop_after > 0 && working.len() >= stop_after {
+            break;
+        }
+    }
+
+    pb.finish_and_clear();
+
+    working.sort_by_key(|(_, used, _)| *used);
+    println!(
+        "\n  {} proxy(ies) sur {} repondent a MEGA.",
+        working.len(),
+        entries.len()
+    );
+    if let Some((index, used, _)) = working.first() {
+        println!(
+            "  Le moins consomme: {} - {} utilises sur sa fenetre de 6 h (numero {})",
+            short_proxy(&entries[*index].url),
+            api::format_bytes(*used),
+            index + 1
+        );
+    } else {
+        println!("  Aucun proxy de cette liste ne repond: essaie une autre liste.");
+    }
+
+    if let Some(path) = out {
+        let mut content = String::from("# megacli --proxy-check: proxies qui repondent a MEGA\n");
+        for (index, _, _) in &working {
+            content.push_str(&entries[*index].url);
+            content.push('\n');
+        }
+        std::fs::write(path, content)
+            .map_err(|e| anyhow::anyhow!("impossible d'ecrire {}: {}", path, e))?;
+        println!("  {} proxy(ies) ecrits dans {}", working.len(), path);
+    }
+
+    Ok(())
+}
+
+/// Pick a starting proxy that actually answers, trying a few entries of the
+/// list. Only *unreachable* proxies are skipped: a proxy that answers but has no
+/// quota left is selected and reported, never dodged by hopping to the next one.
+async fn select_start_proxy(
+    proxies: &[proxy::ProxyEntry],
+    mode: proxy::ProxyMode,
+) -> Result<(usize, Client)> {
+    const BATCH: usize = 8;
+
+    let len = proxies.len();
+    let start = proxy::pick_index(mode, len);
+    let candidates: Vec<usize> = (0..len.min(START_ATTEMPTS))
+        .map(|step| (start + step) % len)
+        .collect();
+
+    for batch in candidates.chunks(BATCH) {
+        let mut probes = Vec::with_capacity(batch.len());
+        for &index in batch {
+            let entry = &proxies[index];
+            probes.push(async move {
+                let outcome = match build_client(Some(&entry.url)) {
+                    Ok(client) => {
+                        match tokio::time::timeout(CHECK_TIMEOUT, api::get_quota_info(&client, None))
+                            .await
+                        {
+                            Ok(Ok(_)) => Ok(()),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_) => Err(format!("timeout ({}s)", CHECK_TIMEOUT.as_secs())),
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                (index, outcome)
+            });
+        }
+
+        let results = futures::future::join_all(probes).await;
+
+        let found = results.iter().find(|(_, outcome)| match outcome {
+            Ok(()) => true,
+            Err(message) => is_quota_message(message.as_str()),
+        });
+
+        if let Some((index, _)) = found {
+            let client = build_client(Some(&proxies[*index].url))?;
+            return Ok((*index, client));
+        }
+
+        println!(
+            "  {} proxy(ies) injoignable(s), on essaie les suivants...",
+            results.len()
+        );
+    }
+
+    Err(anyhow::anyhow!(
+        "aucun des {} premiers proxies ne repond a MEGA.\
+\n  Lance \"--proxy-check-out working.txt\" pour trier la liste, \
+puis \"--proxy-file working.txt\".",
+        candidates.len()
+    ))
+}
+
+/// True when an error message is about MEGA's transfer quota.
+fn is_quota_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("509") || lower.contains("quota")
+}
+
+async fn run_cli(args: CliArgs) -> Result<()> {
+    let mut args = args;
+
+    // --- Proxies ------------------------------------------------------------
+    let proxies = resolve_proxies(&args)?;
+
+    if args.proxy_check {
+        return check_proxies(
+            &proxies,
+            args.proxy_check_out.as_deref(),
+            args.proxy_check_stop,
+        )
+        .await;
+    }
+
+    if args.quota_only {
+        let client = build_client(proxies.first().map(|entry| entry.url.as_str()))?;
+        if let Some(entry) = proxies.first() {
+            println!("  Proxy: {}", entry.url);
+        }
+        return print_quota(&client, None).await;
+    }
+
+    if !api::is_mega_link(&args.link) {
+        eprintln!("Lien MEGA invalide: {}", api::clean_link_input(&args.link));
+        eprintln!("Format attendu: https://mega.nz/folder/<id>#<cle>");
+        std::process::exit(1);
+    }
+    args.link = api::clean_link_input(&args.link);
+
+    let config = download::DownloadConfig {
+        workers: args.workers,
+        speed_limit: args.speed_limit,
+        quota_wait: args.quota_wait,
+    };
+
+    // --- Run -----------------------------------------------------------------
+    // With a list, the starting exit is verified first: a dead entry would
+    // otherwise abort before a single byte is downloaded.
+    let (index, client) = if proxies.len() > 1 {
+        select_start_proxy(&proxies, args.proxy_mode).await?
+    } else {
+        let client = build_client(proxies.first().map(|entry| entry.url.as_str()))?;
+        (0, client)
+    };
+
+    if proxies.len() > 1 {
+        println!(
+            "  Proxy {}/{}: {}",
+            index + 1,
+            proxies.len(),
+            proxies[index].url
+        );
+    } else if let Some(entry) = proxies.first() {
+        println!("  Proxy: {}", entry.url);
+    } else {
+        println!("  Connexion directe (aucun proxy) : le quota est celui de ton IP.");
+    }
+
+    print_quota(&client, None).await?;
+
+    if args.list {
+        return print_list(&client, &args).await;
+    }
+
+    if api::is_folder_link(&args.link) {
+        println!("Dossier: {}", args.link);
+        println!("Destination: {}", args.dest);
+        let report = download::download_folder(&client, &args.link, &args.dest, config).await?;
+        if report.quota_exhausted {
+            advise_other_exit(&proxies, index);
+            std::process::exit(2);
+        }
+        if report.failed > 0 {
+            std::process::exit(1);
+        }
+    } else {
+        println!("Fichier: {}", args.link);
+        match download::download_from_link(&client, &args.link, &args.dest, config).await {
+            Ok(()) => {}
+            Err(e) if is_quota_message(&e.to_string()) => {
+                eprintln!("Quota MEGA atteint: {}", e);
+                advise_other_exit(&proxies, index);
+                std::process::exit(2);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(())
+}
+
+/// After a 509, explain how to resume from another exit - without ever
+/// switching proxy behind the user's back.
+fn advise_other_exit(proxies: &[proxy::ProxyEntry], index: usize) {
+    if proxies.len() > 1 {
+        println!(
+            "  Relancer plus tard (fenetre glissante de 6 h), ou depuis une autre sortie:"
+        );
+        println!(
+            "    --proxy \"{}\"   (ou --proxy-mode random pour en tirer une au hasard)",
+            proxies[(index + 1) % proxies.len()].url
+        );
+    } else if proxies.is_empty() {
+        println!("  Relancer plus tard (fenetre glissante de 6 h), ou avec un proxy/VPN.");
+    }
+}
+
+async fn print_list(client: &Client, args: &CliArgs) -> Result<()> {
+    let entries = download::list_folder(client, &args.link).await?;
+    let base = std::path::Path::new(&args.dest);
+    let mut total = 0u64;
+    let mut remaining = 0u64;
+    let mut files = 0usize;
+    let mut done = 0usize;
+    let mut partial = 0usize;
+
+    for entry in &entries {
+        total += entry.size;
+        if entry.is_dir {
+            println!("  {}/", entry.path.display());
+            continue;
+        }
+
+        files += 1;
+        let path = base.join(&entry.path);
+        let len = std::fs::metadata(&path)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len());
+
+        match download::classify_disk(len, entry.size) {
+            download::DiskState::Complete => {
+                done += 1;
+                println!(
+                    "  [ok]         {}  ({})",
+                    entry.path.display(),
+                    api::format_bytes(entry.size)
+                );
+            }
+            download::DiskState::Partial(have) => {
+                partial += 1;
+                remaining += entry.size.saturating_sub(have);
+                println!(
+                    "  [reprendre]  {}  ({})",
+                    entry.path.display(),
+                    api::format_bytes(entry.size)
+                );
+            }
+            download::DiskState::Missing => {
+                remaining += entry.size;
+                println!(
+                    "  [manquant]   {}  ({})",
+                    entry.path.display(),
+                    api::format_bytes(entry.size)
+                );
+            }
+        }
+    }
+
+    println!(
+        "\n  {} fichier(s), {} au total. Dossier verifie: {}",
+        files,
+        api::format_bytes(total),
+        args.dest
+    );
+    println!(
+        "  {} deja complet(s), {} a reprendre, reste {} a telecharger",
+        done,
+        partial,
+        api::format_bytes(remaining)
+    );
+    println!(
+        "  A ~5 Go par fenetre de 6 h (quota gratuit), prevoir environ {} session(s).",
+        remaining.div_ceil(5 * 1024 * 1024 * 1024).max(1)
+    );
+    Ok(())
+}
+
 // --- Main ---
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
+    if let Some(args) = parse_cli() {
+        return run_cli(args).await;
+    }
 
-    let download_path = dirs::download_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".".to_string());
+    // Proxy can come from the environment (handy for scripts and the menu).
+    let env_list = std::env::var("MEGACLI_PROXY_FILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let proxies = match &env_list {
+        Some(path) => match proxy::load_file(std::path::Path::new(path)) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("MEGACLI_PROXY_FILE ignore: {}", e);
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+
+    // A single --proxy / MEGACLI_PROXY wins over the first line of the list.
+    let proxy = env_proxy().or_else(|| proxies.first().map(|entry| entry.url.clone()));
+    let client = build_client(proxy.as_deref())?;
 
     let mut state = AppState {
+        proxy,
         client,
         session: None,
-        download_path,
+        download_path: default_download_dir(),
         workers: DEFAULT_WORKERS,
         speed_limit: 0,
+        quota_wait: std::time::Duration::ZERO,
+        proxies,
+        proxy_index: 0,
     };
 
     let title = Style::new().bold().green();
@@ -523,25 +1449,38 @@ async fn main() -> Result<()> {
         if let Some(ref s) = state.session {
             println!("{}", Style::new().green().apply_to(format!("Connecte: {}", s.email)));
         }
+        if !state.proxies.is_empty() {
+            println!(
+                "{}",
+                dim.apply_to(format!(
+                    "Proxy: {}/{}  {}",
+                    state.proxy_index + 1,
+                    state.proxies.len(),
+                    state.proxy_label()
+                ))
+            );
+        } else if let Some(ref proxy) = state.proxy {
+            println!("{}", dim.apply_to(format!("Proxy: {}", proxy)));
+        }
         println!();
 
         let sel = Select::new()
-            .with_prompt("Action")
+            .with_prompt("Action  (q ou Echap pour quitter)")
             .items(menu_items)
             .default(0)
-            .interact();
+            .interact_opt();
 
         match sel {
-            Ok(0) => menu_download_link(&mut state).await,
-            Ok(1) => menu_download_cloud(&mut state).await,
-            Ok(2) => menu_upload(&mut state).await,
-            Ok(3) => menu_list_files(&mut state).await,
-            Ok(4) => menu_stream(&mut state).await,
-            Ok(5) => menu_quota(&mut state).await,
-            Ok(6) => menu_mkdir(&mut state).await,
-            Ok(7) => menu_login(&mut state).await,
-            Ok(8) => menu_settings(&mut state).await,
-            Ok(9) | Err(_) => {
+            Ok(Some(0)) => menu_download_link(&mut state).await,
+            Ok(Some(1)) => menu_download_cloud(&mut state).await,
+            Ok(Some(2)) => menu_upload(&mut state).await,
+            Ok(Some(3)) => menu_list_files(&mut state).await,
+            Ok(Some(4)) => menu_stream(&mut state).await,
+            Ok(Some(5)) => menu_quota(&mut state).await,
+            Ok(Some(6)) => menu_mkdir(&mut state).await,
+            Ok(Some(7)) => menu_login(&mut state).await,
+            Ok(Some(8)) => menu_settings(&mut state).await,
+            Ok(Some(9)) | Ok(None) | Err(_) => {
                 println!("Bye!");
                 break;
             }
@@ -553,3 +1492,78 @@ async fn main() -> Result<()> {
 }
 
 const DEFAULT_WORKERS: usize = 6;
+
+#[cfg(test)]
+mod tests {
+    use super::{build_client, describe_quota};
+    use crate::api::QuotaInfo;
+
+    #[test]
+    fn proxy_urls_are_validated() {
+        use super::validate_proxy;
+
+        assert!(validate_proxy("socks5h://127.0.0.1:9050").is_ok());
+        assert!(validate_proxy("socks5://127.0.0.1:1080").is_ok());
+        assert!(validate_proxy("http://127.0.0.1:8080").is_ok());
+        assert!(validate_proxy("SOCKS5H://127.0.0.1:9050").is_ok());
+
+        assert!(validate_proxy("pas-une-url").is_err());
+        assert!(validate_proxy("127.0.0.1:9050").is_err());
+
+        assert!(build_client(Some("socks5h://127.0.0.1:9050")).is_ok());
+        assert!(build_client(Some("pas-une-url")).is_err());
+        assert!(build_client(None).is_ok());
+    }
+
+    #[test]
+    fn quota_errors_are_recognised() {
+        use super::is_quota_message;
+
+        assert!(is_quota_message("HTTP 509 transfer quota exceeded"));
+        assert!(is_quota_message("Quota MEGA atteint"));
+        assert!(!is_quota_message("connection refused"));
+    }
+
+    #[test]
+    fn proxy_labels_are_shortened() {
+        use super::short_proxy;
+
+        assert_eq!(short_proxy("http://1.2.3.4:80"), "http://1.2.3.4:80");
+        let long = short_proxy(&format!("http://user:password@{}.example.com:8080", "a".repeat(40)));
+        assert_eq!(long.len(), 42);
+        assert!(long.ends_with("..."));
+    }
+
+    #[test]
+    fn proxy_file_is_loaded_from_disk() {
+        use crate::proxy;
+
+        let dir = std::env::temp_dir().join("megacli-proxy-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxies.txt");
+        std::fs::write(&path, "# test\n1.2.3.4:8080\n*5.6.7.8:1080\n").unwrap();
+
+        let entries = proxy::load_file(&path).unwrap();
+        assert_eq!(entries.len(), 2, "{:?}", entries);
+        assert_eq!(entries[0].url, "http://1.2.3.4:8080");
+        assert_eq!(entries[1].url, "socks5h://5.6.7.8:1080");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quota_report_mentions_the_ip_window() {
+        let info = QuotaInfo {
+            ip_buckets: vec![1_000_000_000, 500_000_000],
+            bucket_age: Some(1800),
+            storage_used: 10,
+            storage_max: 20,
+            ..QuotaInfo::default()
+        };
+
+        let lines = describe_quota(&info);
+        let joined = lines.join("\n");
+        assert!(joined.contains("fenetre glissante de 6 h"), "{}", joined);
+        assert!(joined.contains("Stockage"), "{}", joined);
+    }
+}

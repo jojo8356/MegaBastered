@@ -2,10 +2,11 @@ use anyhow::{anyhow, Result};
 use ctr::cipher::StreamCipher;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -23,6 +24,52 @@ const MAX_RETRIES: u32 = 8;
 const MAX_URL_REFRESH: u64 = 20;
 /// Suffix of the in-progress file.
 const TEMP_SUFFIX: &str = ".megacli.tmp";
+/// Suffix of the sidecar listing the chunks already on disk.
+const PARTS_SUFFIX: &str = ".megacli.parts";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/// How a transfer should behave.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadConfig {
+    /// Parallel connections per file (1-20).
+    pub workers: usize,
+    /// Bandwidth limit in KiB/s, 0 = unlimited.
+    pub speed_limit: u64,
+    /// When MEGA answers HTTP 509 (transfer quota), wait this long and resume
+    /// instead of giving up. Zero means "stop and let the user come back".
+    pub quota_wait: Duration,
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            workers: 6,
+            speed_limit: 0,
+            quota_wait: Duration::ZERO,
+        }
+    }
+}
+
+/// Why a file could not be downloaded.
+#[derive(Debug)]
+pub enum FileError {
+    /// MEGA's transfer quota (HTTP 509) is exhausted for this IP address.
+    Quota,
+    /// Anything else.
+    Other(String),
+}
+
+impl std::fmt::Display for FileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileError::Quota => write!(f, "quota de transfert MEGA atteint (HTTP 509)"),
+            FileError::Other(message) => write!(f, "{}", message),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -33,11 +80,12 @@ pub async fn download_from_link(
     client: &Client,
     link: &str,
     dest_dir: &str,
-    workers: usize,
-    speed_limit: u64,
+    config: DownloadConfig,
 ) -> Result<()> {
     if api::is_folder_link(link) {
-        return download_folder(client, link, dest_dir, workers, speed_limit).await;
+        return download_folder(client, link, dest_dir, config)
+            .await
+            .map(|_| ());
     }
 
     let link = api::normalize_mega_link(link);
@@ -49,23 +97,59 @@ pub async fn download_from_link(
     let dest = Path::new(dest_dir).join(sanitize_file_name(&filename));
     let source = UrlSource::Link(link);
 
-    if download_file(
-        client,
-        &source,
-        file_size,
-        &file_key,
-        &dest,
-        workers,
-        speed_limit,
-    )
-    .await?
-    {
-        println!("\n  Sauvegarde: {}", dest.display());
-    } else {
-        println!("\n  Deja present: {}", dest.display());
+    match download_file(client, &source, file_size, &file_key, &dest, config).await {
+        Ok(true) => {
+            println!("\n  Sauvegarde: {}", dest.display());
+            Ok(())
+        }
+        Ok(false) => {
+            println!("\n  Deja present: {}", dest.display());
+            Ok(())
+        }
+        Err(FileError::Quota) => Err(anyhow!(
+            "quota de transfert MEGA atteint (HTTP 509) - relance le meme lien plus tard, la reprise est automatique"
+        )),
+        Err(FileError::Other(message)) => Err(anyhow!(message)),
     }
+}
 
-    Ok(())
+/// One entry of a folder listing.
+pub struct FolderEntry {
+    pub path: PathBuf,
+    pub size: u64,
+    pub is_dir: bool,
+}
+
+/// Result of a folder download.
+pub struct FolderReport {
+    pub downloaded: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    /// True when the run stopped early because MEGA's quota was exhausted.
+    pub quota_exhausted: bool,
+}
+
+/// List a public folder without downloading anything.
+pub async fn list_folder(client: &Client, link: &str) -> Result<Vec<FolderEntry>> {
+    let (folder_id, folder_key) = api::extract_folder_id_and_key(link)?;
+    let nodes = api::get_folder_nodes(client, &folder_id, &folder_key).await?;
+    let paths = resolve_paths(&nodes, &folder_id);
+
+    let mut entries: Vec<FolderEntry> = nodes
+        .iter()
+        .filter(|node| node.handle != folder_id)
+        .map(|node| FolderEntry {
+            path: paths
+                .get(&node.handle)
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from(sanitize_file_name(&node.name))),
+            size: node.size,
+            is_dir: node.is_folder(),
+        })
+        .collect();
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
 }
 
 /// Download every file of a public MEGA folder, recreating the directory tree.
@@ -73,9 +157,8 @@ pub async fn download_folder(
     client: &Client,
     link: &str,
     dest_dir: &str,
-    workers: usize,
-    speed_limit: u64,
-) -> Result<()> {
+    config: DownloadConfig,
+) -> Result<FolderReport> {
     let (folder_id, folder_key) = api::extract_folder_id_and_key(link)?;
 
     println!("  Chargement du contenu du dossier...");
@@ -122,31 +205,108 @@ pub async fn download_folder(
         api::format_bytes(total_size)
     );
     println!("  Destination: {}", base.display());
+    println!(
+        "  Rappel: le quota MEGA gratuit est d'environ 5 Go par fenetre de 6 h (par adresse IP)."
+    );
 
     if files.is_empty() {
         println!("\n  Aucun fichier a telecharger (dossiers vides recrees).");
-        return Ok(());
+        return Ok(FolderReport {
+            downloaded: 0,
+            skipped: 0,
+            failed: 0,
+            quota_exhausted: false,
+        });
+    }
+
+    // --- Fast pre-check -----------------------------------------------------
+    // A single concurrent metadata pass tells what is already on disk, so a
+    // finished file costs one stat call and never triggers a download URL.
+    println!("\n  Verification des fichiers deja presents...");
+    let targets: Vec<(u64, PathBuf)> = files
+        .iter()
+        .map(|(node, relative)| (node.size, base.join(relative)))
+        .collect();
+    let states = scan_disk(&targets).await;
+
+    let mut pending: Vec<usize> = Vec::new();
+    let mut skipped_bytes = 0u64;
+    let mut cleaned = 0usize;
+
+    for (index, state) in states.iter().enumerate() {
+        match state {
+            DiskState::Complete => {
+                skipped_bytes += files[index].0.size;
+                if cleanup_sidecars(&targets[index].1).await {
+                    cleaned += 1;
+                }
+            }
+            DiskState::Partial(_) | DiskState::Missing => pending.push(index),
+        }
+    }
+
+    let complete = states.len() - pending.len();
+    let pending_bytes: u64 = pending.iter().map(|index| files[*index].0.size).sum();
+
+    println!(
+        "  {} fichier(s) deja complet(s) ({}) ignore(s)",
+        complete,
+        api::format_bytes(skipped_bytes)
+    );
+    println!(
+        "  {} fichier(s) a telecharger ou reprendre ({})",
+        pending.len(),
+        api::format_bytes(pending_bytes)
+    );
+    if cleaned > 0 {
+        println!(
+            "  {} fichier(s) temporaire(s) obsolete(s) nettoye(s)",
+            cleaned
+        );
+    }
+
+    if pending.is_empty() {
+        println!("\n  Tout est deja telecharge, rien a faire.");
+        return Ok(FolderReport {
+            downloaded: 0,
+            skipped: complete,
+            failed: 0,
+            quota_exhausted: false,
+        });
+    }
+
+    let sessions = pending_bytes.div_ceil(5 * 1024 * 1024 * 1024).max(1);
+    if pending_bytes > 5 * 1024 * 1024 * 1024 {
+        println!(
+            "  A ~5 Go par fenetre de 6 h (quota gratuit), prevoir ~{} session(s)",
+            sessions
+        );
     }
 
     let started = Instant::now();
-    let mut downloaded = 0usize;
-    let mut skipped = 0usize;
-    let mut skipped_bytes = 0u64;
+    let mut report = FolderReport {
+        downloaded: 0,
+        skipped: complete,
+        failed: 0,
+        quota_exhausted: false,
+    };
     let mut done_bytes = 0u64;
     let mut failures: Vec<(String, String)> = Vec::new();
 
-    for (index, (node, relative)) in files.iter().enumerate() {
+    for (position, index) in pending.iter().enumerate() {
+        let (node, relative) = &files[*index];
         let dest = base.join(relative);
         println!(
             "\n  [{}/{}] {} ({})",
-            index + 1,
-            files.len(),
+            position + 1,
+            pending.len(),
             relative.display(),
             api::format_bytes(node.size)
         );
 
         if node.key.is_empty() {
             println!("  Echec: cle de dechiffrement indisponible");
+            report.failed += 1;
             failures.push((relative.display().to_string(), "cle indisponible".to_string()));
             continue;
         }
@@ -156,29 +316,32 @@ pub async fn download_folder(
             handle: node.handle.clone(),
         };
 
-        match download_file(
-            client,
-            &source,
-            node.size,
-            &node.key,
-            &dest,
-            workers,
-            speed_limit,
-        )
-        .await
-        {
+        match download_file(client, &source, node.size, &node.key, &dest, config).await {
             Ok(true) => {
-                downloaded += 1;
+                report.downloaded += 1;
                 done_bytes += node.size;
             }
             Ok(false) => {
-                skipped += 1;
+                // Completed by another run in the meantime.
+                report.skipped += 1;
                 skipped_bytes += node.size;
                 println!("  Deja present, ignore");
             }
-            Err(e) => {
-                println!("  Echec: {}", e);
-                failures.push((relative.display().to_string(), e.to_string()));
+            Err(FileError::Quota) => {
+                // MEGA blocks the whole IP address, not just this file: no
+                // point hammering the remaining files.
+                report.failed += 1;
+                report.quota_exhausted = true;
+                failures.push((relative.display().to_string(), FileError::Quota.to_string()));
+                println!(
+                    "\n  Quota MEGA atteint (509). Arret du dossier: les {} fichier(s) restant(s) seront repris en relancant la meme commande.",
+                    pending.len() - position - 1
+                );
+                break;
+            }
+            Err(FileError::Other(message)) => {
+                report.failed += 1;
+                failures.push((relative.display().to_string(), message));
             }
         }
     }
@@ -190,9 +353,9 @@ pub async fn download_folder(
     println!(
         "  Termine en {} - {} telecharge(s), {} deja present(s), {} en echec",
         format_duration(elapsed),
-        downloaded,
-        skipped,
-        failures.len()
+        report.downloaded,
+        report.skipped,
+        report.failed
     );
     if done_bytes > 0 {
         println!(
@@ -213,11 +376,25 @@ pub async fn download_folder(
         if failures.len() > 20 {
             println!("    ... et {} autre(s)", failures.len() - 20);
         }
-        println!("\n  Relance le meme lien pour reprendre les fichiers manquants.");
-        return Err(anyhow!("{} fichier(s) en echec", failures.len()));
     }
 
-    Ok(())
+    if report.quota_exhausted {
+        // Everything that was planned but did not make it to disk.
+        let remaining = pending_bytes.saturating_sub(done_bytes);
+        let next_try = next_quota_hint();
+        println!(
+            "\n  Quota MEGA epuise (HTTP 509) - environ 5 Go par fenetre glissante de 6 h, par IP."
+        );
+        println!(
+            "  Il reste {} a recuperer. Les fichiers complets sont ignores et les autres reprennent chunk par chunk: rien n'est retelecharge deux fois.",
+            api::format_bytes(remaining)
+        );
+        println!("  {}", next_try);
+    } else if !failures.is_empty() {
+        println!("\n  Relance le meme lien pour reprendre les fichiers manquants.");
+    }
+
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -244,21 +421,70 @@ impl UrlSource {
     }
 }
 
+/// State shared by the workers of one file.
+struct Shared {
+    chunks: Vec<(u64, u64)>,
+    /// One flag per chunk: written to disk and recorded in the sidecar.
+    completed: Vec<AtomicBool>,
+    /// Chunks left to fetch in the current round.
+    queue: StdMutex<VecDeque<usize>>,
+    /// Set when MEGA answers HTTP 509.
+    quota: AtomicBool,
+    /// Set when the file cannot be completed (network, HTTP error, ...).
+    failure: StdMutex<Option<String>>,
+    /// Temp file (taken out of the slot to close it before renaming).
+    file: Mutex<Option<tokio::fs::File>>,
+    /// Sidecar listing the completed chunk offsets.
+    parts: Mutex<Option<tokio::fs::File>>,
+    dl_url: RwLock<String>,
+    url_generation: AtomicU64,
+    url_refreshes: AtomicU64,
+    throttle: Throttle,
+    progress: ProgressBar,
+    fetched: AtomicU64,
+}
+
+impl Shared {
+    fn fail(&self, message: impl Into<String>) {
+        let mut slot = self.failure.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(message.into());
+        }
+    }
+
+    fn failed(&self) -> bool {
+        match self.failure.lock() {
+            Ok(slot) => slot.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
+    }
+
+    fn remaining(&self) -> Vec<usize> {
+        self.completed
+            .iter()
+            .enumerate()
+            .filter(|(_, done)| !done.load(Ordering::SeqCst))
+            .map(|(index, _)| index)
+            .collect()
+    }
+}
+
 /// Download one file into `dest_path`.
 ///
 /// Returns `Ok(true)` when the file was downloaded, `Ok(false)` when it was
-/// already complete on disk. Interrupted downloads are kept in a `.megacli.tmp`
-/// file and resumed on the next run (only the missing part is fetched again).
-#[allow(clippy::too_many_arguments)]
+/// already complete on disk. Progress is tracked per chunk in a `.megacli.parts`
+/// sidecar: an interrupted transfer resumes exactly where it stopped, and a
+/// partial file is never reported as complete.
 async fn download_file(
     client: &Client,
     source: &UrlSource,
     file_size: u64,
     file_key: &str,
     dest_path: &Path,
-    workers: usize,
-    speed_limit: u64,
-) -> Result<bool> {
+    config: DownloadConfig,
+) -> Result<bool, FileError> {
+    let fail = |message: String| -> Result<bool, FileError> { Err(FileError::Other(message)) };
+
     // Already there?
     if let Ok(meta) = tokio::fs::metadata(dest_path).await {
         if meta.is_file() && meta.len() == file_size {
@@ -267,7 +493,9 @@ async fn download_file(
     }
 
     if let Some(parent) = dest_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| FileError::Other(format!("creation du dossier: {}", e)))?;
     }
 
     let file_name = dest_path
@@ -275,128 +503,309 @@ async fn download_file(
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "fichier".to_string());
     let temp_path = dest_path.with_file_name(format!("{}{}", file_name, TEMP_SUFFIX));
+    let parts_path = dest_path.with_file_name(format!("{}{}", file_name, PARTS_SUFFIX));
 
     if file_size == 0 {
-        tokio::fs::write(dest_path, b"").await?;
+        tokio::fs::write(dest_path, b"")
+            .await
+            .map_err(|e| FileError::Other(format!("ecriture: {}", e)))?;
         return Ok(true);
     }
 
-    let (aes_key, aes_iv) = derive_file_keys(file_key)?;
+    let (aes_key, aes_iv) = derive_file_keys(file_key).map_err(|e| FileError::Other(e.to_string()))?;
+    let aes_key = Arc::new(aes_key);
+    let aes_iv = Arc::new(aes_iv);
     let chunks = build_chunks(file_size);
-    let workers = workers.clamp(1, MAX_WORKERS);
+    let workers = config.workers.clamp(1, MAX_WORKERS);
 
-    // --- Resume support -----------------------------------------------------
-    // The temp file is only ever written at real chunk offsets, so its length
-    // tells how many bytes were fully written. A half written chunk is simply
-    // re-downloaded from its start.
-    let mut on_disk = 0u64;
-    if let Ok(meta) = tokio::fs::metadata(&temp_path).await {
-        if meta.is_file() && meta.len() <= file_size {
-            on_disk = meta.len();
-        }
+    // --- Resume -------------------------------------------------------------
+    let mut completed_offsets = load_parts(&parts_path).await;
+    let temp_exists = tokio::fs::metadata(&temp_path)
+        .await
+        .map(|meta| meta.is_file() && meta.len() > 0)
+        .unwrap_or(false);
+
+    if !temp_exists && !completed_offsets.is_empty() {
+        // Sidecar without data: start over.
+        completed_offsets.clear();
+        let _ = tokio::fs::remove_file(&parts_path).await;
+    } else if temp_exists && completed_offsets.is_empty() {
+        // A temp file left by an older version (no sidecar): we cannot trust
+        // its content, so restart this file cleanly.
+        println!("  Ancien fichier temporaire ignore, reprise depuis zero");
+        let _ = tokio::fs::remove_file(&temp_path).await;
     }
 
-    let (start_index, resume_at) = resume_plan(&chunks, file_size, on_disk);
+    let known: HashSet<u64> = chunks.iter().map(|(offset, _)| *offset).collect();
+    completed_offsets.retain(|offset| known.contains(offset));
 
-    let file = OpenOptions::new()
+    let temp = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(&temp_path)
-        .await?;
-    if file.metadata().await?.len() != resume_at {
-        file.set_len(resume_at).await?;
+        .await
+        .map_err(|e| FileError::Other(format!("ouverture du fichier temporaire: {}", e)))?;
+
+    if temp
+        .metadata()
+        .await
+        .map(|meta| meta.len() > file_size)
+        .unwrap_or(false)
+    {
+        temp.set_len(0)
+            .await
+            .map_err(|e| FileError::Other(format!("troncature: {}", e)))?;
+        completed_offsets.clear();
+        let _ = tokio::fs::remove_file(&parts_path).await;
     }
 
-    if resume_at > 0 {
-        println!("  Reprise a {}", api::format_bytes(resume_at));
+    let parts = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&parts_path)
+        .await
+        .map_err(|e| FileError::Other(format!("ouverture de l'index de reprise: {}", e)))?;
+
+    let mut completed: Vec<AtomicBool> = Vec::with_capacity(chunks.len());
+    let mut done_bytes = 0u64;
+    for (offset, size) in &chunks {
+        let done = completed_offsets.contains(offset);
+        if done {
+            done_bytes += size;
+        }
+        completed.push(AtomicBool::new(done));
     }
 
-    // --- Progress -----------------------------------------------------------
-    let pb = ProgressBar::new(file_size);
-    pb.set_style(progress_style());
-    pb.set_prefix(short_label(&file_name, 26));
-    pb.set_position(resume_at);
+    let remaining: VecDeque<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !completed[*index].load(Ordering::SeqCst))
+        .map(|(index, _)| index)
+        .collect();
 
-    // --- Shared state -------------------------------------------------------
-    let output_file = Arc::new(Mutex::new(file));
-    let chunks = Arc::new(chunks);
-    let next_chunk = Arc::new(AtomicU64::new(start_index as u64));
-    let failed = Arc::new(AtomicBool::new(false));
-    let throttle = Arc::new(Throttle::new(speed_limit));
-    let aes_key = Arc::new(aes_key);
-    let aes_iv = Arc::new(aes_iv);
+    if done_bytes > 0 {
+        println!(
+            "  Reprise: {} deja sur le disque ({} au total)",
+            api::format_bytes(done_bytes),
+            api::format_bytes(file_size)
+        );
+    }
 
-    // Download URLs expire, so the current one is shared and renew on demand.
-    let dl_url = Arc::new(RwLock::new(source.fetch(client).await?));
-    let url_generation = Arc::new(AtomicU64::new(0));
-    let url_refreshes = Arc::new(AtomicU64::new(0));
+    let progress = new_progress(file_size, &file_name, done_bytes);
+    let dl_url = source
+        .fetch(client)
+        .await
+        .map_err(|e| classify_api_error(&e))?;
 
+    let shared = Arc::new(Shared {
+        chunks: chunks.clone(),
+        completed,
+        queue: StdMutex::new(remaining),
+        quota: AtomicBool::new(false),
+        failure: StdMutex::new(None),
+        file: Mutex::new(Some(temp)),
+        parts: Mutex::new(Some(parts)),
+        dl_url: RwLock::new(dl_url),
+        url_generation: AtomicU64::new(0),
+        url_refreshes: AtomicU64::new(0),
+        throttle: Throttle::new(config.speed_limit),
+        progress: progress.clone(),
+        fetched: AtomicU64::new(done_bytes),
+    });
+
+    // --- Rounds -------------------------------------------------------------
+    // A round runs every remaining chunk once. If MEGA's quota interrupts it we
+    // either wait (when asked to) or stop, keeping what is already on disk.
+    let mut healed = false;
+    loop {
+        // Refill the queue with whatever is still missing (a quota hit in the
+        // previous round leaves the chunk it was fetching out of the queue).
+        {
+            let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.clear();
+            queue.extend(shared.remaining());
+        }
+
+        run_workers(client, source, file_size, &aes_key, &aes_iv, workers, &shared).await;
+
+        if shared.remaining().is_empty() {
+            let len = file_len(&temp_path).await;
+            if len == file_size {
+                break;
+            }
+
+            if healed {
+                progress.abandon_with_message("incomplet");
+                close_handles(&shared).await;
+                return fail(format!(
+                    "fichier incomplet apres verification: {} / {}",
+                    api::format_bytes(len),
+                    api::format_bytes(file_size)
+                ));
+            }
+
+            // The index said "everything is there" but the file is short (left
+            // over from an interrupted run). Redo this file once, chunk by
+            // chunk, instead of failing forever.
+            healed = true;
+            println!(
+                "  Verification: {} / {} - fichier retéléchargé pour etre sur",
+                api::format_bytes(len),
+                api::format_bytes(file_size)
+            );
+            reset_for_retry(&shared, &parts_path).await?;
+            continue;
+        }
+
+        if shared.quota.load(Ordering::SeqCst) {
+            if config.quota_wait.is_zero() {
+                close_handles(&shared).await;
+                progress.abandon_with_message("quota MEGA atteint");
+                return Err(FileError::Quota);
+            }
+
+            println!(
+                "  Quota MEGA atteint (509). Pause de {} avant reprise (Ctrl+C pour arreter, la reprise reste possible).",
+                format_duration(config.quota_wait)
+            );
+            tokio::time::sleep(config.quota_wait).await;
+
+            // New URL + fresh round.
+            match source.fetch(client).await {
+                Ok(url) => {
+                    *shared.dl_url.write().await = url;
+                    shared.quota.store(false, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    if is_quota_error(&e) {
+                        continue; // still over quota: wait again
+                    }
+                    close_handles(&shared).await;
+                    progress.abandon_with_message("erreur API");
+                    return Err(FileError::Other(e.to_string()));
+                }
+            }
+        } else if shared.failed() {
+            let reason = match shared.failure.lock() {
+                Ok(slot) => slot.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            close_handles(&shared).await;
+            progress.abandon_with_message("interrompu");
+            return Err(FileError::Other(
+                reason.unwrap_or_else(|| "telechargement interrompu".to_string()),
+            ));
+        } else {
+            // Round ended without any explicit error but chunks are missing.
+            close_handles(&shared).await;
+            progress.abandon_with_message("incomplet");
+            return Err(FileError::Other(
+                "chunks manquants apres plusieurs tentatives".to_string(),
+            ));
+        }
+
+    }
+
+    // --- Finalize -----------------------------------------------------------
+    flush_and_close(&shared).await;
+    let written = file_len(&temp_path).await;
+
+    if written != file_size {
+        progress.abandon_with_message("incomplet");
+        return fail(format!(
+            "fichier incomplet: {} / {}",
+            api::format_bytes(written),
+            api::format_bytes(file_size)
+        ));
+    }
+
+    if dest_path.exists() {
+        tokio::fs::remove_file(dest_path)
+            .await
+            .map_err(|e| FileError::Other(format!("suppression de l'ancien fichier: {}", e)))?;
+    }
+    tokio::fs::rename(&temp_path, dest_path)
+        .await
+        .map_err(|e| FileError::Other(format!("renommage final: {}", e)))?;
+    let _ = tokio::fs::remove_file(&parts_path).await;
+
+    progress.finish_and_clear();
+    Ok(true)
+}
+
+/// Run one round: every worker pulls chunks from the queue until it is empty.
+async fn run_workers(
+    client: &Client,
+    source: &UrlSource,
+    file_size: u64,
+    aes_key: &Arc<Vec<u8>>,
+    aes_iv: &Arc<Vec<u8>>,
+    workers: usize,
+    shared: &Arc<Shared>,
+) {
     let mut handles = Vec::new();
+
     for _ in 0..workers {
+        let shared = shared.clone();
         let client = client.clone();
         let source = source.clone();
-        let chunks = chunks.clone();
-        let next_chunk = next_chunk.clone();
-        let failed = failed.clone();
-        let output_file = output_file.clone();
-        let throttle = throttle.clone();
         let aes_key = aes_key.clone();
         let aes_iv = aes_iv.clone();
-        let dl_url = dl_url.clone();
-        let url_generation = url_generation.clone();
-        let url_refreshes = url_refreshes.clone();
-        let pb = pb.clone();
 
         handles.push(tokio::spawn(async move {
             loop {
-                if failed.load(Ordering::Relaxed) {
+                if shared.quota.load(Ordering::SeqCst) || shared.failed() {
                     break;
                 }
 
-                let index = next_chunk.fetch_add(1, Ordering::SeqCst) as usize;
-                if index >= chunks.len() {
-                    break;
-                }
+                let index = {
+                    let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.pop_front()
+                };
+                let index = match index {
+                    Some(index) => index,
+                    None => break,
+                };
 
-                let (offset, size) = chunks[index];
-                let current_url = dl_url.read().await.clone();
-                let chunk_url = gen_chunk_url(&current_url, file_size, offset, size);
+                let (offset, size) = shared.chunks[index];
+                let url = shared.dl_url.read().await.clone();
+                let chunk_url = gen_chunk_url(&url, file_size, offset, size);
 
                 let encrypted = match fetch_chunk(&client, &chunk_url, size).await {
                     Ok(data) => data,
+                    Err(ChunkError::Quota) => {
+                        shared.quota.store(true, Ordering::SeqCst);
+                        break;
+                    }
                     Err(ChunkError::Expired) => {
-                        // Renew the download URL and retry this chunk once.
-                        match refresh_url(
-                            &client,
-                            &source,
-                            &dl_url,
-                            &url_generation,
-                            &url_refreshes,
-                        )
-                        .await
-                        {
-                            Ok(fresh_url) => {
-                                let retry_url = gen_chunk_url(&fresh_url, file_size, offset, size);
-                                match fetch_chunk(&client, &retry_url, size).await {
+                        match refresh_url(&client, &source, &shared).await {
+                            Ok(fresh) => {
+                                let retry = gen_chunk_url(&fresh, file_size, offset, size);
+                                match fetch_chunk(&client, &retry, size).await {
                                     Ok(data) => data,
+                                    Err(ChunkError::Quota) => {
+                                        shared.quota.store(true, Ordering::SeqCst);
+                                        break;
+                                    }
                                     Err(e) => {
-                                        report_error(&pb, offset, size, &e.to_string());
-                                        failed.store(true, Ordering::Relaxed);
+                                        shared.fail(e.to_string());
                                         break;
                                     }
                                 }
                             }
                             Err(e) => {
-                                report_error(&pb, offset, size, &e.to_string());
-                                failed.store(true, Ordering::Relaxed);
+                                if matches!(e, ChunkError::Quota) {
+                                    shared.quota.store(true, Ordering::SeqCst);
+                                } else {
+                                    shared.fail(e.to_string());
+                                }
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        report_error(&pb, offset, size, &e.to_string());
-                        failed.store(true, Ordering::Relaxed);
+                        shared.fail(e.to_string());
                         break;
                     }
                 };
@@ -404,95 +813,141 @@ async fn download_file(
                 // Decrypt the chunk at its own position in the file stream.
                 let mut buffer = encrypted;
                 let iv = forward_mega_link_key_iv(aes_iv.as_slice(), offset);
-                let mut cipher = make_aes_ctr_cipher(aes_key.as_slice(), &iv);
-                cipher.apply_keystream(&mut buffer);
+                make_aes_ctr_cipher(aes_key.as_slice(), &iv).apply_keystream(&mut buffer);
 
                 {
-                    let mut file = output_file.lock().await;
+                    let mut guard = shared.file.lock().await;
+                    let Some(file) = guard.as_mut() else {
+                        break;
+                    };
                     if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
-                        report_error(&pb, offset, size, &format!("seek: {}", e));
-                        failed.store(true, Ordering::Relaxed);
+                        shared.fail(format!("seek: {}", e));
                         break;
                     }
                     if let Err(e) = file.write_all(&buffer).await {
-                        report_error(&pb, offset, size, &format!("ecriture: {}", e));
-                        failed.store(true, Ordering::Relaxed);
+                        shared.fail(format!("ecriture: {}", e));
+                        break;
+                    }
+                    // tokio::fs::File buffers writes: without this flush the
+                    // bytes can still be pending while the chunk is recorded as
+                    // done, which produced "100% but incomplete" files.
+                    if let Err(e) = file.flush().await {
+                        shared.fail(format!("flush: {}", e));
                         break;
                     }
                 }
 
-                pb.inc(size);
-                throttle.consume(size).await;
+                // Record the chunk only once its bytes are really on disk.
+                shared.completed[index].store(true, Ordering::SeqCst);
+                {
+                    let mut guard = shared.parts.lock().await;
+                    if let Some(parts) = guard.as_mut() {
+                        if parts
+                            .write_all(format!("{}\n", offset).as_bytes())
+                            .await
+                            .is_ok()
+                        {
+                            let _ = parts.flush().await;
+                        }
+                    }
+                }
+
+                shared.fetched.fetch_add(size, Ordering::Relaxed);
+                shared.progress.inc(size);
+                shared.throttle.consume(size).await;
             }
         }));
     }
 
     for handle in handles {
         if let Err(e) = handle.await {
-            failed.store(true, Ordering::Relaxed);
-            pb.suspend(|| eprintln!("\n  Tache interrompue: {}", e));
+            shared.fail(format!("tache interrompue: {}", e));
+        }
+    }
+}
+
+/// Close the temp file and the sidecar (needed before renaming on Windows).
+async fn close_handles(shared: &Arc<Shared>) {
+    let _ = shared.file.lock().await.take();
+    let _ = shared.parts.lock().await.take();
+}
+
+/// Flush pending writes, then release both handles.
+async fn flush_and_close(shared: &Arc<Shared>) {
+    let mut guard = shared.file.lock().await;
+    if let Some(file) = guard.as_mut() {
+        let _ = file.flush().await;
+    }
+    let _ = guard.take();
+
+    let mut parts = shared.parts.lock().await;
+    if let Some(file) = parts.as_mut() {
+        let _ = file.flush().await;
+    }
+    let _ = parts.take();
+}
+
+/// Size of a file on disk (0 when it does not exist).
+async fn file_len(path: &Path) -> u64 {
+    tokio::fs::metadata(path)
+        .await
+        .map(|meta| meta.len())
+        .unwrap_or(0)
+}
+
+/// Forget the resume index and start the file again from the first chunk.
+async fn reset_for_retry(shared: &Arc<Shared>, parts_path: &Path) -> Result<(), FileError> {
+    {
+        let mut guard = shared.file.lock().await;
+        if let Some(file) = guard.as_mut() {
+            file.set_len(0)
+                .await
+                .map_err(|e| FileError::Other(format!("troncature: {}", e)))?;
+            let _ = file.flush().await;
         }
     }
 
-    // Release the file handle (needed on Windows before renaming).
-    drop(output_file);
+    *shared.parts.lock().await = None;
+    let _ = tokio::fs::remove_file(parts_path).await;
 
-    if failed.load(Ordering::Relaxed) {
-        pb.abandon_with_message("interrompu");
-        return Err(anyhow!(
-            "telechargement interrompu - relance pour reprendre ({})",
-            temp_path.display()
-        ));
+    let parts = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(parts_path)
+        .await
+        .map_err(|e| FileError::Other(format!("reinitialisation de l'index: {}", e)))?;
+    *shared.parts.lock().await = Some(parts);
+
+    for done in &shared.completed {
+        done.store(false, Ordering::SeqCst);
     }
 
-    let written = tokio::fs::metadata(&temp_path).await?.len();
-    if written != file_size {
-        pb.abandon_with_message("incomplet");
-        return Err(anyhow!(
-            "fichier incomplet: {} / {}",
-            api::format_bytes(written),
-            api::format_bytes(file_size)
-        ));
-    }
+    let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+    queue.clear();
+    queue.extend(0..shared.chunks.len());
 
-    pb.finish_and_clear();
+    shared.progress.set_position(0);
+    shared.fetched.store(0, Ordering::Relaxed);
 
-    if dest_path.exists() {
-        tokio::fs::remove_file(dest_path).await?;
-    }
-    tokio::fs::rename(&temp_path, dest_path).await?;
-
-    Ok(true)
-}
-
-fn report_error(pb: &ProgressBar, offset: u64, size: u64, message: &str) {
-    pb.suspend(|| {
-        eprintln!(
-            "\n  Erreur chunk {}-{} : {}",
-            offset,
-            offset + size.saturating_sub(1),
-            message
-        )
-    });
+    Ok(())
 }
 
 /// Get a new download URL, making sure only one worker renews it at a time.
 async fn refresh_url(
     client: &Client,
     source: &UrlSource,
-    dl_url: &Arc<RwLock<String>>,
-    generation: &Arc<AtomicU64>,
-    refreshes: &Arc<AtomicU64>,
+    shared: &Arc<Shared>,
 ) -> Result<String, ChunkError> {
-    let seen = generation.load(Ordering::SeqCst);
-    let mut guard = dl_url.write().await;
+    let seen = shared.url_generation.load(Ordering::SeqCst);
+    let mut guard = shared.dl_url.write().await;
 
     // Somebody else already renewed it while we were waiting for the lock.
-    if generation.load(Ordering::SeqCst) != seen {
+    if shared.url_generation.load(Ordering::SeqCst) != seen {
         return Ok(guard.clone());
     }
 
-    if refreshes.fetch_add(1, Ordering::SeqCst) >= MAX_URL_REFRESH {
+    if shared.url_refreshes.fetch_add(1, Ordering::SeqCst) >= MAX_URL_REFRESH {
         return Err(ChunkError::Fatal(
             "lien de telechargement expire (trop de renouvellements)".to_string(),
         ));
@@ -501,13 +956,18 @@ async fn refresh_url(
     match source.fetch(client).await {
         Ok(url) => {
             *guard = url.clone();
-            generation.fetch_add(1, Ordering::SeqCst);
+            shared.url_generation.fetch_add(1, Ordering::SeqCst);
             Ok(url)
         }
-        Err(e) => Err(ChunkError::Transient(format!(
-            "renouvellement du lien impossible: {}",
-            e
-        ))),
+        Err(e) => {
+            if is_quota_error(&e) {
+                return Err(ChunkError::Quota);
+            }
+            Err(ChunkError::Transient(format!(
+                "renouvellement du lien impossible: {}",
+                e
+            )))
+        }
     }
 }
 
@@ -515,7 +975,9 @@ async fn refresh_url(
 enum ChunkError {
     /// HTTP 403: the download URL has expired.
     Expired,
-    /// Retrying will not help (quota, missing node, ...).
+    /// HTTP 509: MEGA's transfer quota is exhausted for this IP.
+    Quota,
+    /// Retrying on this URL will not help.
     Fatal(String),
     /// Worth another try (network hiccup, 5xx, truncated body).
     Transient(String),
@@ -525,6 +987,7 @@ impl std::fmt::Display for ChunkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChunkError::Expired => write!(f, "lien expire (HTTP 403)"),
+            ChunkError::Quota => write!(f, "quota de transfert MEGA atteint (HTTP 509)"),
             ChunkError::Fatal(message) | ChunkError::Transient(message) => {
                 write!(f, "{}", message)
             }
@@ -539,7 +1002,7 @@ async fn fetch_chunk(client: &Client, url: &str, expected: u64) -> Result<Vec<u8
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
             let backoff = 1u64 << (attempt.min(4) - 1);
-            tokio::time::sleep(Duration::from_secs(backoff.min(8))).await;
+            tokio::time::sleep(Duration::from_millis((backoff * 500).min(8_000))).await;
         }
 
         match try_fetch_chunk(client, url, expected).await {
@@ -552,11 +1015,7 @@ async fn fetch_chunk(client: &Client, url: &str, expected: u64) -> Result<Vec<u8
     Err(ChunkError::Transient(last_error))
 }
 
-async fn try_fetch_chunk(
-    client: &Client,
-    url: &str,
-    expected: u64,
-) -> Result<Vec<u8>, ChunkError> {
+async fn try_fetch_chunk(client: &Client, url: &str, expected: u64) -> Result<Vec<u8>, ChunkError> {
     let response = client
         .get(url)
         .header("User-Agent", "Mozilla/5.0")
@@ -570,14 +1029,14 @@ async fn try_fetch_chunk(
         return Err(ChunkError::Expired);
     }
     if status.as_u16() == 509 {
-        return Err(ChunkError::Fatal(
-            "quota de transfert MEGA atteint (HTTP 509)".to_string(),
-        ));
+        return Err(ChunkError::Quota);
+    }
+    if status.as_u16() == 429 {
+        return Err(ChunkError::Transient("HTTP 429 (trop de requetes)".to_string()));
     }
     if !status.is_success() {
         let message = format!("HTTP {}", status.as_u16());
-        let transient = status.is_server_error() || status.as_u16() == 429;
-        return Err(if transient {
+        return Err(if status.is_server_error() {
             ChunkError::Transient(message)
         } else {
             ChunkError::Fatal(message)
@@ -604,21 +1063,73 @@ async fn try_fetch_chunk(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Where to resume a partially downloaded file: index of the first incomplete
-/// chunk and the byte offset to restart from.
-fn resume_plan(chunks: &[(u64, u64)], file_size: u64, on_disk: u64) -> (usize, u64) {
-    let mut start_index = 0usize;
-    while start_index < chunks.len() && chunks[start_index].0 + chunks[start_index].1 <= on_disk {
-        start_index += 1;
+/// What a destination file looks like on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskState {
+    /// File present with the expected size.
+    Complete,
+    /// File present but not finished (bytes already on disk).
+    Partial(u64),
+    /// Nothing on disk yet.
+    Missing,
+}
+
+/// Classify a destination file from its size (if any) and the expected size.
+pub fn classify_disk(len: Option<u64>, expected: u64) -> DiskState {
+    match len {
+        Some(len) if len == expected => DiskState::Complete,
+        Some(len) if len > 0 => DiskState::Partial(len),
+        _ => DiskState::Missing,
+    }
+}
+
+/// Stat every target file concurrently.
+async fn scan_disk(targets: &[(u64, PathBuf)]) -> Vec<DiskState> {
+    let mut states = Vec::with_capacity(targets.len());
+
+    for chunk in targets.chunks(128) {
+        let futures = chunk.iter().map(|(size, path)| async move {
+            let len = tokio::fs::metadata(path)
+                .await
+                .ok()
+                .filter(|meta| meta.is_file())
+                .map(|meta| meta.len());
+            classify_disk(len, *size)
+        });
+        states.extend(futures::future::join_all(futures).await);
     }
 
-    let resume_at = if start_index < chunks.len() {
-        chunks[start_index].0
-    } else {
-        file_size
+    states
+}
+
+/// Remove the temp file and the resume index of a finished download.
+/// Returns true when something was actually deleted.
+async fn cleanup_sidecars(dest: &Path) -> bool {
+    let Some(name) = dest.file_name().map(|name| name.to_string_lossy().to_string()) else {
+        return false;
     };
 
-    (start_index, resume_at)
+    let mut removed = false;
+    for suffix in [TEMP_SUFFIX, PARTS_SUFFIX] {
+        let leftover = dest.with_file_name(format!("{}{}", name, suffix));
+        if leftover.exists() && tokio::fs::remove_file(&leftover).await.is_ok() {
+            removed = true;
+        }
+    }
+    removed
+}
+
+/// Read the sidecar of completed chunk offsets.
+async fn load_parts(path: &Path) -> HashSet<u64> {
+    let mut offsets = HashSet::new();
+    if let Ok(content) = tokio::fs::read_to_string(path).await {
+        for line in content.lines() {
+            if let Ok(offset) = line.trim().parse::<u64>() {
+                offsets.insert(offset);
+            }
+        }
+    }
+    offsets
 }
 
 /// Split a MEGA file into its (offset, size) chunks.
@@ -654,14 +1165,33 @@ fn derive_file_keys(file_key: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     }
 }
 
+/// Turn an API error into the right file error.
+fn classify_api_error(error: &anyhow::Error) -> FileError {
+    if is_quota_error(error) {
+        FileError::Quota
+    } else {
+        FileError::Other(error.to_string())
+    }
+}
+
+/// MEGA reports an exhausted transfer quota with `-17` or HTTP 509.
+fn is_quota_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("-17") || text.contains("509") || text.contains("quota")
+}
+
+/// Human hint about when MEGA's rolling quota window frees credit again.
+fn next_quota_hint() -> String {
+    "Le quota se libere progressivement: la fenetre glisse sur 6 h, donc reessaie dans 1 a 6 h - ou lance la commande avec `-q 60` pour qu'elle attende et reprenne toute seule.".to_string()
+}
+
 /// Build the relative path of every node of a folder listing.
 fn resolve_paths(nodes: &[api::FileNode], folder_id: &str) -> HashMap<String, PathBuf> {
     let by_handle: HashMap<&str, &api::FileNode> =
         nodes.iter().map(|node| (node.handle.as_str(), node)).collect();
 
     // The shared folder itself is the root: it is either listed under its own
-    // handle (usually without a key) or absent from the listing. Its name is
-    // never part of a download path.
+    // handle or absent from the listing. `folder_id` is our conceptual root.
     let mut paths = HashMap::new();
 
     for node in nodes {
@@ -729,12 +1259,26 @@ pub fn sanitize_file_name(name: &str) -> String {
     }
 }
 
-fn progress_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "  {prefix} {bar:32.cyan/blue} {percent:>3}% {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
-    )
-    .unwrap_or_else(|_| ProgressStyle::default_bar())
-    .progress_chars("=>-")
+fn new_progress(total: u64, label: &str, position: u64) -> ProgressBar {
+    if !std::io::stdout().is_terminal() {
+        // Piped output: a bar would just spam the log.
+        let pb = ProgressBar::hidden();
+        pb.set_length(total);
+        pb.set_position(position);
+        return pb;
+    }
+
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  {prefix} {bar:32.cyan/blue} {percent:>3}% {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=>-"),
+    );
+    pb.set_prefix(short_label(label, 26));
+    pb.set_position(position);
+    pb
 }
 
 fn short_label(name: &str, max: usize) -> String {
@@ -802,11 +1346,8 @@ impl Throttle {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_chunks, derive_file_keys, resume_plan, resolve_paths, sanitize_file_name};
+    use super::*;
     use crate::api::FileNode;
-    use crate::crypto::{forward_mega_link_key_iv, make_aes_ctr_cipher, url_base64_encode};
-    use ctr::cipher::StreamCipher;
-    use std::path::PathBuf;
 
     fn node(handle: &str, parent: &str, node_type: i32, name: &str) -> FileNode {
         FileNode {
@@ -865,23 +1406,18 @@ mod tests {
 
     #[test]
     fn per_chunk_decryption_matches_a_single_stream() {
-        // 32 byte node key (two 16 byte halves XOR-ed together by MEGA).
         let raw_key: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
         let key_b64 = url_base64_encode(&raw_key);
         let (aes_key, aes_iv) = derive_file_keys(&key_b64).unwrap();
-        assert_eq!(aes_key.len(), 16);
-        assert_eq!(aes_iv.len(), 16);
 
         let size = 3 * 1024 * 1024 + 12_345u64;
         let plaintext: Vec<u8> = (0..size)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
             .collect();
 
-        // What MEGA stores: the whole file encrypted as one CTR stream.
         let mut ciphertext = plaintext.clone();
         make_aes_ctr_cipher(&aes_key, &aes_iv).apply_keystream(&mut ciphertext);
 
-        // What we download: independent chunks, each decrypted at its offset.
         let mut decrypted = vec![0u8; size as usize];
         for (offset, chunk_size) in build_chunks(size) {
             let iv = forward_mega_link_key_iv(&aes_iv, offset);
@@ -906,20 +1442,55 @@ mod tests {
         assert_eq!(aes_iv[8..], [0u8; 8]);
     }
 
+    #[tokio::test]
+    async fn parts_sidecar_round_trips() {
+        let dir = std::env::temp_dir().join(format!("megacli-test-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("x.megacli.parts");
+
+        let mut offsets = HashSet::new();
+        offsets.insert(0u64);
+        offsets.insert(131_072u64);
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        for offset in &offsets {
+            file.write_all(format!("{}\n", offset).as_bytes())
+                .await
+                .unwrap();
+        }
+        file.flush().await.unwrap();
+        drop(file);
+
+        assert_eq!(load_parts(&path).await, offsets);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn missing_parts_file_means_no_progress() {
+        let path = std::env::temp_dir().join("megacli-does-not-exist.megacli.parts");
+        let _ = tokio::fs::remove_file(&path).await;
+        assert!(load_parts(&path).await.is_empty());
+    }
+
     #[test]
-    fn resume_only_restarts_unfinished_chunks() {
-        let chunks = build_chunks(3 * 1024 * 1024);
+    fn completed_offsets_are_filtered_against_the_plan() {
+        // A sidecar written for another file size must not be trusted.
+        let chunks = build_chunks(1024);
+        let plan: HashSet<u64> = chunks.iter().map(|(offset, _)| *offset).collect();
 
-        assert_eq!(resume_plan(&chunks, 3 * 1024 * 1024, 0), (0, 0));
+        let mut loaded: HashSet<u64> = HashSet::new();
+        loaded.insert(0);
+        loaded.insert(999_999);
 
-        // First chunk fully written, second one partial.
-        assert_eq!(resume_plan(&chunks, 3 * 1024 * 1024, 131_072 + 1000), (1, 131_072));
-
-        // Everything is on disk: nothing left to do.
-        assert_eq!(
-            resume_plan(&chunks, 3 * 1024 * 1024, 3 * 1024 * 1024),
-            (chunks.len(), 3 * 1024 * 1024)
-        );
+        loaded.retain(|offset| plan.contains(offset));
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains(&0));
     }
 
     #[test]
@@ -945,19 +1516,27 @@ mod tests {
             paths.get("F3"),
             Some(&PathBuf::from("Module 1").join("Sous-dossier").join("notes.txt"))
         );
-        // Unknown parent: keep the file at the root instead of losing it.
         assert_eq!(paths.get("F4"), Some(&PathBuf::from("orphelin.txt")));
-        // The shared folder itself is never part of a path.
         assert_eq!(paths.get("ROOT"), None);
     }
 
     #[test]
     fn file_names_are_sanitized() {
-        assert_eq!(sanitize_file_name("Module 1 - Creer sa boutique"), "Module 1 - Creer sa boutique");
-        assert_eq!(sanitize_file_name("a/b\\c:d*e?f\"g<h>i|j"), "a_b_c_d_e_f_g_h_i_j");
+        assert_eq!(
+            sanitize_file_name("Module 1 - Creer sa boutique"),
+            "Module 1 - Creer sa boutique"
+        );
+
+        // Every character Windows refuses in a file name becomes "_".
+        let dirty = format!("a/b{c}d:e*f?g", c = '\\');
+        let dirty = format!("{dirty}\"h<i>j|k");
+        assert_eq!(sanitize_file_name(&dirty), "a_b_d_e_f_g_h_i_j_k");
+
         assert_eq!(sanitize_file_name("   "), "sans_nom");
         assert_eq!(sanitize_file_name(".."), "sans_nom");
-        assert_eq!(sanitize_file_name("ligne\nbrisee"), "ligne_brisee");
+
+        let newline = format!("ligne{}brisee", '\n');
+        assert_eq!(sanitize_file_name(&newline), "ligne_brisee");
     }
 
     #[test]
@@ -973,5 +1552,76 @@ mod tests {
     fn invalid_node_keys_are_rejected() {
         assert!(derive_file_keys("AAAA").is_err());
         assert!(derive_file_keys("").is_err());
+    }
+
+    #[test]
+    fn quota_errors_are_recognised() {
+        let error = anyhow!("MEGA API error -17 (quota de transfert depasse)");
+        assert!(is_quota_error(&error));
+        assert!(matches!(classify_api_error(&error), FileError::Quota));
+
+        let other = anyhow!("MEGA API error -9 (element introuvable)");
+        assert!(!is_quota_error(&other));
+        assert!(matches!(classify_api_error(&other), FileError::Other(_)));
+    }
+
+    #[test]
+    fn disk_state_classification() {
+        assert_eq!(classify_disk(None, 100), DiskState::Missing);
+        assert_eq!(classify_disk(Some(0), 100), DiskState::Missing);
+        assert_eq!(classify_disk(Some(100), 100), DiskState::Complete);
+        assert_eq!(classify_disk(Some(40), 100), DiskState::Partial(40));
+        // Bigger than expected: the file is wrong, it will be downloaded again.
+        assert_eq!(classify_disk(Some(200), 100), DiskState::Partial(200));
+        // Empty files are legitimately complete at zero byte.
+        assert_eq!(classify_disk(Some(0), 0), DiskState::Complete);
+    }
+
+    #[tokio::test]
+    async fn scan_reports_each_target() {
+        let dir = std::env::temp_dir().join(format!("megacli-scan-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let done = dir.join("done.bin");
+        let partial = dir.join("partial.bin");
+        let missing = dir.join("missing.bin");
+        tokio::fs::write(&done, vec![0u8; 8]).await.unwrap();
+        tokio::fs::write(&partial, vec![0u8; 3]).await.unwrap();
+
+        let targets = vec![
+            (8u64, done.clone()),
+            (8, partial.clone()),
+            (8, missing.clone()),
+        ];
+        let states = scan_disk(&targets).await;
+
+        assert_eq!(states[0], DiskState::Complete);
+        assert_eq!(states[1], DiskState::Partial(3));
+        assert_eq!(states[2], DiskState::Missing);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn finished_files_lose_their_leftovers() {
+        let dir = std::env::temp_dir().join(format!("megacli-clean-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let dest = dir.join("video.mkv");
+        let tmp = dir.join(format!("video.mkv{}", TEMP_SUFFIX));
+        let parts = dir.join(format!("video.mkv{}", PARTS_SUFFIX));
+        for path in [&dest, &tmp, &parts] {
+            tokio::fs::write(path, b"x").await.unwrap();
+        }
+
+        assert!(cleanup_sidecars(&dest).await);
+        assert!(dest.exists(), "the finished file must be kept");
+        assert!(!tmp.exists());
+        assert!(!parts.exists());
+
+        // Nothing left to clean.
+        assert!(!cleanup_sidecars(&dest).await);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
