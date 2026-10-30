@@ -860,6 +860,7 @@ fn validate_folder_key(folder_key: &str, link: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn extract_folder_id_and_key(link: &str) -> Result<(String, String)> {
     let (folder_id, folder_key, _) = extract_folder_link_details(link)?;
     Ok((folder_id, folder_key))

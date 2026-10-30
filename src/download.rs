@@ -1272,7 +1272,7 @@ fn resolve_paths(nodes: &[api::FileNode], folder_id: &str) -> HashMap<String, Pa
 /// Resolve a human-readable folder path to the matching MEGA node handle.
 fn resolve_folder_handle(nodes: &[api::FileNode], folder_id: &str, folder_path: &str) -> Result<String> {
     let requested: Vec<String> = folder_path
-        .split(|ch| ch == '/' || ch == '\\')
+        .split(['/', '\\'])
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .map(|part| part.to_string())
